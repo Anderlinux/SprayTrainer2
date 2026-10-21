@@ -216,6 +216,49 @@ void TestRepetitionSection() {
     Check(!st::ProfileFromJson(many.dump(), d).ok, "mais de 11 teclas de parar é rejeitado");
 }
 
+void TestAutoVisionSection() {
+    // Round-trip completo das configurações de reconhecimento automático.
+    st::ProfileData p = st::DefaultProfile();
+    p.autoVisionEnabled = true;
+    p.autoRegionX = 100;
+    p.autoRegionY = 200;
+    p.autoRegionW = 640;
+    p.autoRegionH = 480;
+    p.autoWindowTitle = "Counter-Strike 2";
+    p.autoConfidenceMin = 0.9f;
+    p.autoIntervalMs = 350;
+    p.autoConfirmFrames = 5;
+    const std::string json = st::ProfileToJson(p);
+    st::ProfileData back;
+    const st::ParseResult r = st::ProfileFromJson(json, back);
+    Check(r.ok && back == p, "seção autoVision sobrevive ao save/load");
+
+    // Perfil antigo sem a seção abre com os padrões (desligado), silenciosamente.
+    nlohmann::json old = nlohmann::json::parse(st::ProfileToJson(st::DefaultProfile()));
+    old.erase("autoVision");
+    st::ProfileData d;
+    const st::ParseResult legacy = st::ProfileFromJson(old.dump(), d);
+    Check(legacy.ok && legacy.warnings.empty() && d == st::DefaultProfile() && !d.autoVisionEnabled,
+          "perfis sem autoVision usam o padrão desligado sem avisos");
+
+    // Valores fora da faixa são ajustados com aviso, não rejeitados.
+    nlohmann::json clampj = nlohmann::json::parse(json);
+    clampj["autoVision"]["intervalMs"] = 999999;
+    clampj["autoVision"]["confirmFrames"] = 50;
+    st::ProfileData clamped;
+    const st::ParseResult cr = st::ProfileFromJson(clampj.dump(), clamped);
+    Check(cr.ok && clamped.autoIntervalMs == 2000 && clamped.autoConfirmFrames == 10 && !cr.warnings.empty(),
+          "intervalo/confirmações fora da faixa são ajustados com aviso");
+
+    // Tipos errados são erros claros.
+    nlohmann::json badtype = nlohmann::json::parse(json);
+    badtype["autoVision"]["enabled"] = "sim";
+    Check(!st::ProfileFromJson(badtype.dump(), d).ok, "enabled não booleano é rejeitado");
+    nlohmann::json badreg = nlohmann::json::parse(json);
+    badreg["autoVision"]["region"] = {1, 2, 3};
+    Check(!st::ProfileFromJson(badreg.dump(), d).ok, "region com tamanho errado é rejeitada");
+}
+
 st::BurstRecord SampleBurst(std::int64_t t, st::Weapon w, float score) {
     st::BurstRecord b;
     b.timestamp = t;
@@ -298,6 +341,7 @@ int main() {
     TestStore(root);
     TestOptionalSections();
     TestRepetitionSection();
+    TestAutoVisionSection();
     TestHistory(root);
     TestFactoryDefaultsMatchUserProfile();
     std::error_code ec;

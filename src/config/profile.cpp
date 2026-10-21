@@ -171,6 +171,36 @@ public:
         out = it->get<bool>();
     }
 
+    // Como Int, mas para campos opcionais de seções novas: ausente = padrão, sem aviso.
+    void IntOpt(const Json& obj, const std::string& section, const char* key, int& out, int lo, int hi) {
+        const auto it = obj.find(key);
+        if (it == obj.end()) {
+            return;
+        }
+        if (!it->is_number_integer()) {
+            Error(section + "." + key, "deveria ser um número inteiro");
+            return;
+        }
+        const long long v = it->get<long long>();
+        out = static_cast<int>(std::clamp<long long>(v, lo, hi));
+        if (out != v) {
+            Warn(section + "." + key + " fora da faixa; ajustado");
+        }
+    }
+
+    // Texto opcional (seções novas): ausente = mantém o padrão, sem aviso.
+    void StrOpt(const Json& obj, const std::string& section, const char* key, std::string& out) {
+        const auto it = obj.find(key);
+        if (it == obj.end()) {
+            return;
+        }
+        if (!it->is_string()) {
+            Error(section + "." + key, "deveria ser um texto");
+            return;
+        }
+        out = it->get<std::string>();
+    }
+
     // Nome de tecla virtual ("F", "LBUTTON"...); aceita maiúsculas/minúsculas.
     // `optional` = seções adicionadas depois da versão 1 (ausente não gera aviso).
     void KeyField(const Json& obj, const std::string& section, const char* key, int& out, bool optional = false) {
@@ -280,7 +310,11 @@ bool ProfileData::operator==(const ProfileData& o) const {
            repeatReturnBack == o.repeatReturnBack &&
            repeatRestartFromZero == o.repeatRestartFromZero &&
            cycleWeaponKeyVk == o.cycleWeaponKeyVk &&
-           cycleBackKeyVk == o.cycleBackKeyVk;
+           cycleBackKeyVk == o.cycleBackKeyVk &&
+           autoVisionEnabled == o.autoVisionEnabled && autoRegionX == o.autoRegionX &&
+           autoRegionY == o.autoRegionY && autoRegionW == o.autoRegionW && autoRegionH == o.autoRegionH &&
+           autoWindowTitle == o.autoWindowTitle && autoConfidenceMin == o.autoConfidenceMin &&
+           autoIntervalMs == o.autoIntervalMs && autoConfirmFrames == o.autoConfirmFrames;
 }
 
 ProfileData DefaultProfile() {
@@ -357,6 +391,20 @@ std::string ProfileToJson(const ProfileData& d) {
     } else {
         rp["cycleBackKey"] = "OFF";
     }
+
+    // "autoVision" entrou depois da versão 1: perfis antigos não têm a seção.
+    OrderedJson& av = j["autoVision"];
+    av["enabled"] = d.autoVisionEnabled;
+    av["windowTitle"] = d.autoWindowTitle;
+    OrderedJson region = OrderedJson::array();
+    region.push_back(d.autoRegionX);
+    region.push_back(d.autoRegionY);
+    region.push_back(d.autoRegionW);
+    region.push_back(d.autoRegionH);
+    av["region"] = std::move(region);
+    av["confidenceMin"] = Pretty(d.autoConfidenceMin);
+    av["intervalMs"] = d.autoIntervalMs;
+    av["confirmFrames"] = d.autoConfirmFrames;
 
     return j.dump(2) + "\n";
 }
@@ -535,6 +583,42 @@ ParseResult ProfileFromJson(const std::string& text, ProfileData& out) {
                 }
             }
         }
+    }
+
+    // "autoVision" entrou depois da versão 1: seção ausente = tudo desligado/padrão,
+    // sem aviso (perfis antigos continuam carregando normalmente).
+    if (const Json* av = rd.Section(j, "autoVision", true)) {
+        rd.BoolOpt(*av, "autoVision", "enabled", d.autoVisionEnabled);
+        rd.StrOpt(*av, "autoVision", "windowTitle", d.autoWindowTitle);
+        if (const auto reg = av->find("region"); reg != av->end()) {
+            if (!reg->is_array() || reg->size() != 4) {
+                rd.Error("autoVision.region", "deveria ser uma lista [x, y, w, h]");
+            } else {
+                int vals[4];
+                bool bad = false;
+                for (std::size_t i = 0; i < 4; ++i) {
+                    const Json& v = (*reg)[i];
+                    if (!v.is_number_integer()) {
+                        rd.Error("autoVision.region", "deveria conter quatro números inteiros");
+                        bad = true;
+                        break;
+                    }
+                    vals[i] = static_cast<int>(std::clamp<long long>(v.get<long long>(), -32768, 32767));
+                }
+                if (!bad) {
+                    d.autoRegionX = vals[0];
+                    d.autoRegionY = vals[1];
+                    d.autoRegionW = std::clamp(vals[2], 0, kMaxAutoRegionSize);
+                    d.autoRegionH = std::clamp(vals[3], 0, kMaxAutoRegionSize);
+                    if (vals[2] != d.autoRegionW || vals[3] != d.autoRegionH) {
+                        rd.Warn("autoVision.region fora da faixa; ajustado");
+                    }
+                }
+            }
+        }
+        rd.Float(*av, "autoVision", "confidenceMin", d.autoConfidenceMin, 0.0f, 1.0f, true);
+        rd.IntOpt(*av, "autoVision", "intervalMs", d.autoIntervalMs, 100, 2000);
+        rd.IntOpt(*av, "autoVision", "confirmFrames", d.autoConfirmFrames, 1, 10);
     }
 
     if (rd.Failed()) {

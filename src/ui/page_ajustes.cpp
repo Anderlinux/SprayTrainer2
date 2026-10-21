@@ -1,10 +1,14 @@
 #include "ui/pages.h"
 #include "core/repetition.h"
+#include "platform/win32/capture.h"
 #include "ui/pattern_editor.h"
+#include "ui/profiles.h"
 #include "ui/spray_plot.h"
+#include "ui/textures.h"
 #include "ui/theme.h"
 #include "ui/widgets.h"
 
+#include <backends/imgui_impl_dx11.h>  // ImGui_ImplDX11_InvalidateDeviceObjects (cache de textura da prévia)
 #include <imgui.h>
 
 #include <algorithm>
@@ -16,11 +20,15 @@
 
 namespace st::pages {
 
+// Canal pedido->App declarado em pages.h (a página desenha dentro do contexto
+// ImGui do App, mas só o App pode capturar tela/decodificar PNG/carregar texturas).
+AutoVisionUiRequests g_autoVisionReq;
+
 namespace {
 
 using icons::Icon;
 
-enum SettingsTab { kTabPatterns = 0, kTabTraining, kTabRepetition, kTabOverlay, kTabInterface };
+enum SettingsTab { kTabPatterns = 0, kTabTraining, kTabRepetition, kTabAutoVision, kTabOverlay, kTabInterface };
 
 struct AccentPreset {
     const char* name;
@@ -39,8 +47,14 @@ bool SameColor(const ImVec4& a, const ImVec4& b) {
     return std::abs(a.x - b.x) < 0.002f && std::abs(a.y - b.y) < 0.002f && std::abs(a.z - b.z) < 0.002f;
 }
 
+// state.ui.accent é Rgba4 portável (app_state.h não pode incluir <imgui.h>);
+// aqui na UI já temos ImVec4, então comparamos via cópia dos componentes.
+bool SameColor(const Rgba4& a, const ImVec4& b) {
+    return std::abs(a.x - b.x) < 0.002f && std::abs(a.y - b.y) < 0.002f && std::abs(a.z - b.z) < 0.002f;
+}
+
 void SetAccent(AppState& state, const ImVec4& color) {
-    state.ui.accent = color;
+    state.ui.accent = Rgba4{color.x, color.y, color.z, 1.0f};
     theme::SetAccent(color);
     theme::Apply();  // contexto da janela principal; o overlay reaplica sozinho
 }
@@ -59,7 +73,7 @@ void TabPatterns(AppState& state) {
 
     const float tilesW = ImGui::GetContentRegionAvail().x;
     Weapon w = state.editorWeapon;
-    if (widgets::WeaponTiles("##editorWeapon", state.weaponIcons, &w, tilesW, 0.9f, false, 7)) {
+    if (widgets::WeaponTiles("##editorWeapon", state.weaponIcons, state.weaponIconW, state.weaponIconH, &w, tilesW, 0.9f, false, 7)) {
         state.editorWeapon = w;
         state.editorRow = -1;
     }
@@ -473,14 +487,278 @@ void TabInterface(AppState& state) {
     InterfacePreview(state);
 }
 
+// ------------------------------------------------------------- Auto-Reconhecimento
+
+namespace {
+
+// Cache das texturas DX11 da prévia (região capturada). As imagens mudam a cada
+// captura; recriar a textura só quando o conteúdo muda evita lixo de GPU por
+// frame. As texturas são criadas fora do backend: nenhum draw entre frames
+// referencia a srv antiga, então ReleaseTexture simples é suficiente.
+struct AutoVisionPreviewCache {
+    st::Texture previewTex;
+    std::string previewKey;  // assinatura "WxH|tam" do último RGB enviado
+};
+
+void UpdateCachedTexture(st::Texture& tex, std::string& key, const std::string& newKey, ID3D11Device* device,
+                         const unsigned char* data, std::size_t size) {
+    if (key == newKey && tex.Valid()) {
+        return;  // conteúdo igual ao do último frame: mantém a textura
+    }
+    ReleaseTexture(tex);
+    if (device != nullptr && data != nullptr && size > 0) {
+        LoadTextureFromMemory(device, data, size, tex);
+        key = newKey;
+    } else {
+        key.clear();
+    }
+}
+
+const char* AutoStatusText(int status) {
+    switch (status) {
+        case static_cast<int>(AutoPicker::Status::Pending):
+            return "Reconhecendo (aguardando confirmacoes)...";
+        case static_cast<int>(AutoPicker::Status::Identified):
+            return "Arma identificada";
+        case static_cast<int>(AutoPicker::Status::Ambiguous):
+            return "Ambiguo: duas imagens parecidas acima do minimo";
+        case static_cast<int>(AutoPicker::Status::LowScore):
+            return "Nao reconhecido (confianca abaixo do minimo)";
+        default:
+            return "Aguardando imagem na regiao";
+    }
+}
+
+std::string FormatClockTime(double msSinceAppStart, double nowMs) {
+    // Hora local aproximada: relógio do app é GetTickCount64; convertemos a
+    // última troca para hh:mm:ss usando a hora atual do sistema menos o tempo
+    // decorrido desde então.
+    SYSTEMTIME sysTime{};
+    GetLocalTime(&sysTime);
+    long long totalSec = static_cast<long long>(sysTime.wHour) * 3600 + static_cast<long long>(sysTime.wMinute) * 60 +
+                         static_cast<long long>(sysTime.wSecond);
+    if (msSinceAppStart < -1.0e8 || nowMs < msSinceAppStart) {
+        return "--:--:--";
+    }
+    totalSec -= static_cast<long long>((nowMs - msSinceAppStart) / 1000.0);
+    if (totalSec < 0) {
+        totalSec += 24 * 3600;
+    }
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%02d:%02d:%02d", static_cast<int>(totalSec / 3600) % 24,
+                  static_cast<int>((totalSec / 60) % 60), static_cast<int>(totalSec % 60));
+    return buf;
+}
+
+// Converte o flat RGB24 da prévia (estado da UI) na struct ImageRgb do núcleo.
+ImageRgb RgbFromFlat(int w, int h, const std::vector<std::uint8_t>& rgb) {
+    ImageRgb img;
+    img.width = w;
+    img.height = h;
+    img.rgb = rgb;
+    return img;
+}
+
+void TabAutoVision(AppState& state) {
+    static AutoVisionPreviewCache cache;
+    widgets::BeginCard("##autoVisionCard", ImVec2(0.0f, 0.0f));
+    if (widgets::BeginSettings("##autoVisionRows")) {
+        widgets::SettingLabel("Reconhecimento automatico ligado",
+                              "Com o modo AUTO ligado, o app vigia a regiao configurada e troca de arma "
+                              "sozinho quando reconhece a imagem cadastrada. F1/F2 continuam funcionando "
+                              "normalmente (modo manual nunca foi removido); desligue o auto para voltar 100% ao comportamento antigo.");
+        const bool wasEnabled = state.autoVision.enabled;
+        widgets::Toggle("##autoVisionEnabled", &state.autoVision.enabled, 30.0f);
+        if (state.autoVision.enabled != wasEnabled) {
+            SaveCurrent(state);  // religar/desligar persiste imediatamente
+            g_autoVisionReq.reloadTemplates = true;
+        }
+
+        // ------------------------------------------------ região monitorada
+        widgets::SettingLabel("Janela monitorada",
+                              "Escolha o jogo/janela: a regiao passa a ser medida DENTRO da area cliente dela, "
+                              "entao mover a janela acompanha a regiao automaticamente. Se a janela for fechada "
+                              "ou minimizada, o app mostra erro e PARA de capturar (nunca usa coordenadas mortas). "
+                              "\"Tela fixa\" usa coordenadas absolutas do monitor.");
+        static std::vector<std::string> windowTitles;
+        static bool titlesLoaded = false;
+        if (!titlesLoaded || ImGui::SmallButton("Atualizar janelas##autoWinRefresh")) {
+            windowTitles = ListTopLevelWindowTitles(128);
+            titlesLoaded = true;
+        }
+        ImGui::SetNextItemWidth(320.0f);
+        int winIdx = -1;  // 0 = tela fixa; >=1 indice em windowTitles
+        for (std::size_t i = 0; i < windowTitles.size(); ++i) {
+            if (windowTitles[i] == state.autoVision.windowTitle) {
+                winIdx = static_cast<int>(i) + 1;
+                break;
+            }
+        }
+        const std::string preview = state.autoVision.windowTitle.empty() ? "(tela fixa)" : state.autoVision.windowTitle;
+        if (ImGui::BeginCombo("##autoWindow", preview.c_str())) {
+            if (ImGui::Selectable("(tela fixa)", winIdx < 0)) {
+                state.autoVision.windowTitle.clear();
+                g_autoVisionReq.reloadTemplates = true;
+            }
+            for (std::size_t i = 0; i < windowTitles.size(); ++i) {
+                if (ImGui::Selectable(windowTitles[i].c_str(), static_cast<int>(i) + 1 == winIdx)) {
+                    state.autoVision.windowTitle = windowTitles[i];
+                    g_autoVisionReq.reloadTemplates = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        widgets::SettingLabel("Regiao (X, Y, Largura, Altura)",
+                              "Pixels da area onde as imagens serao procuradas. A regiao fica FIXA; o conteudo "
+                              "dentro dela pode mudar livremente. Use valores pequenos (ex.: 200x120 sobre o HUD "
+                              "da arma). L/A invalidos = estado \"aguardando configuracao\".");
+        bool regionEdited = false;
+        regionEdited |= ImGui::DragInt2("Posicao##autoPos", &state.autoVision.regionX, 1.0f, -8192, 8192);
+        regionEdited |= ImGui::DragInt2("Tamanho##autoSize", &state.autoVision.regionW, 1.0f, 0, kMaxAutoRegionSize);
+        if (regionEdited) {
+            state.autoVision.regionW = std::clamp(state.autoVision.regionW, 0, kMaxAutoRegionSize);
+            state.autoVision.regionH = std::clamp(state.autoVision.regionH, 0, kMaxAutoRegionSize);
+            g_autoVisionReq.reloadTemplates = true;
+        }
+        if (state.autoVision.regionW <= 0 || state.autoVision.regionH <= 0) {
+            widgets::Caption("Aguardando configuracao: defina largura e altura da regiao.", theme::kPink);
+        }
+
+        if (ImGui::Button("Capturar previa da regiao##autoPreview")) {
+            g_autoVisionReq.capturePreview = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Testar reconhecimento agora##autoTest")) {
+            g_autoVisionReq.testMatch = true;
+        }
+        if (state.autoVisionCaptureFailed) {
+            widgets::Caption("Erro de captura (janela indisponivel ou BitBlt falhou).", theme::kPink);
+        }
+
+        // Previa: ultima captura bem-sucedida feita pelo App (RGB -> textura).
+        if (!state.autoVisionPreviewRgb.empty() && state.autoVisionPreviewW > 0 && state.autoVisionPreviewH > 0) {
+            const std::string key = std::to_string(state.autoVisionPreviewW) + "x" +
+                                    std::to_string(state.autoVisionPreviewH) + "|" +
+                                    std::to_string(state.autoVisionPreviewRgb.size());
+            UpdateCachedTexture(cache.previewTex, cache.previewKey, key, state.dx11Device,
+                                state.autoVisionPreviewRgb.data(), state.autoVisionPreviewRgb.size());
+            if (cache.previewTex.Valid()) {
+                const float maxW = 320.0f;
+                const float scale = maxW / cache.previewTex.width;
+                ImGui::TextColored(theme::kTextDim, "Previa da regiao (%dx%d):", state.autoVisionPreviewW,
+                                   state.autoVisionPreviewH);
+                ImGui::Image(cache.previewTex.Id(), ImVec2(maxW, cache.previewTex.height * scale));
+            }
+        }
+
+        // ------------------------------------------------ parâmetros
+        widgets::SettingLabel("Confianca minima",
+                              "Similaridade necessaria para aceitar um reconhecimento (curva SAD logaritmica: "
+                              "0.85 ~ diferenca media de ~6/255 por canal). Suba se houver falsos positivos; "
+                              "baixe se o jogo renderizar com variacoes fortes.");
+        if (ImGui::SliderFloat("##autoConf", &state.autoVision.confidenceMin, 0.0f, 1.0f, "%.2f")) {
+            g_autoVisionReq.reloadTemplates = true;
+        }
+        widgets::SettingLabel("Intervalo entre verificacoes",
+                              "Milissegundos entre capturas no modo auto. 200 ms ja e bem responsivo para "
+                              "troca de arma; reduza apenas se precisar.");
+        if (ImGui::SliderInt("##autoInterval", &state.autoVision.intervalMs, 100, 2000, "%d ms")) {
+            g_autoVisionReq.reloadTemplates = true;
+        }
+        widgets::SettingLabel("Confirmacoes consecutivas",
+                              "Quantas leituras iguais seguidas antes de trocar a arma (anti-oscilacao: "
+                              "evita executo duplicado quando duas imagens piscam alternadamente).");
+        if (ImGui::SliderInt("##autoConfirm", &state.autoVision.confirmFrames, 1, 10)) {
+            g_autoVisionReq.reloadTemplates = true;
+        }
+
+        // ------------------------------------------------ imagens de referência
+        widgets::SettingLabel("Imagens de referencia por arma",
+                              "Uma imagem por arma. Cadastre recortando a PREVIA (botao abaixo de cada arma "
+                              "com previa capturada) ou importando um PNG. As imagens ficam embutidas no perfil "
+                              "(PNG em base64) e sobrevivem ao reinicio — sem caminhos externos que quebram.");
+        for (int i = 0; i < static_cast<int>(Weapon::Count); ++i) {
+            const WeaponInfo& info = GetWeaponInfo(static_cast<Weapon>(i));
+            const WeaponImageEntry* entry = AutoVisionController::WeaponImageEntryFor(state, i);
+            ImGui::PushID(i);
+            ImGui::AlignTextToFramePadding();
+            ImGui::Text("%.*s", static_cast<int>(info.name.size()), info.name.data());
+            ImGui::SameLine(180.0f);
+            if (entry != nullptr) {
+                ImGui::TextColored(theme::kCyan, "imagem cadastrada");
+            } else {
+                ImGui::TextColored(theme::kTextDim, "sem imagem");
+            }
+            ImGui::SameLine(330.0f);
+            if (ImGui::SmallButton("Cadastrar da previa") && !state.autoVisionPreviewRgb.empty()) {
+                std::vector<unsigned char> png;
+                EncodePngRgb(RgbFromFlat(state.autoVisionPreviewW, state.autoVisionPreviewH, state.autoVisionPreviewRgb),
+                             png);
+                state.autoVisionTemplateId = std::string(info.id);
+                state.autoVisionTemplatePng.assign(png.begin(), png.end());
+                g_autoVisionReq.importWeaponIndex = i;  // App grava via importedPng
+                g_autoVisionReq.importedPng = std::move(png);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Importar PNG")) {
+                g_autoVisionReq.importWeaponIndex = i;
+            }
+            if (entry != nullptr) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Remover")) {
+                    g_autoVisionReq.removeImageIndex = i;
+                }
+            }
+            ImGui::PopID();
+        }
+        if (g_autoVisionReq.importFailed) {
+            widgets::Caption("Falha ao importar PNG (cancelado, arquivo invalido ou imagem maior que a regiao).",
+                             theme::kPink);
+        }
+
+        // ------------------------------------------------ status ao vivo
+        widgets::SettingLabel("Status do reconhecimento",
+                              "Leitura ao vivo do motor automatico (atualiza a cada frame enquanto o auto esta "
+                              "ligado). O resultado do \"Testar agora\" aparece aqui sem trocar nenhuma arma.");
+        const bool running = state.autoVision.enabled;
+        ImGui::BulletText("Estado: %s", running ? AutoStatusText(state.autoVisionStatus) : "Desligado (modo manual)");
+        if (running && state.autoVisionRecognized >= 0 && state.autoVisionRecognized < static_cast<int>(Weapon::Count)) {
+            const WeaponInfo& info = GetWeaponInfo(static_cast<Weapon>(state.autoVisionRecognized));
+            ImGui::SameLine();
+            ImGui::TextColored(theme::kCyan, "arma: %.*s", static_cast<int>(info.name.size()), info.name.data());
+        }
+        ImGui::BulletText("Confianca: %.1f%%", state.autoVisionConfidence * 100.0f);
+        ImGui::BulletText("Ultima troca: %s", FormatClockTime(state.autoVisionLastSwitchMs, state.nowMs).c_str());
+        if (!state.autoVisionLastReason.empty()) {
+            ImGui::BulletText("Motivo/rejeicao: %s", state.autoVisionLastReason.c_str());
+        }
+        if (state.autoVisionTestConfidence >= 0.0f) {
+            const bool ok = state.autoVisionTestConfidence >= state.autoVision.confidenceMin &&
+                            !state.autoVisionTestWeaponName.empty();
+            ImGui::BulletText("Teste manual: ");
+            ImGui::SameLine();
+            if (ok) {
+                ImGui::TextColored(theme::kCyan, "%s — confianca %.1f%%", state.autoVisionTestWeaponName.c_str(),
+                                   state.autoVisionTestConfidence * 100.0f);
+            } else {
+                ImGui::TextColored(theme::kPink, "nenhuma imagem atingiu o minimo (%.1f%%)",
+                                   state.autoVisionTestConfidence * 100.0f);
+            }
+        }
+        widgets::EndSettings();
+    }
+    widgets::EndCard();
+}
+
 }  // namespace
 
 void Ajustes(AppState& state) {
     if (!ImGui::BeginTabBar("##settingsTabs")) {
         return;
     }
-    const char* names[] = {"Padrões de recuo", "Treino", "Repetição", "Overlay", "Interface"};
-    for (int i = 0; i < 5; ++i) {
+    const char* names[] = {"Padrões de recuo", "Treino", "Repetição", "Auto-Reconhecimento", "Overlay", "Interface"};
+    for (int i = 0; i < 6; ++i) {
         ImGuiTabItemFlags flags = ImGuiTabItemFlags_None;
         if (state.settingsTabRequest == i) {
             flags |= ImGuiTabItemFlags_SetSelected;
@@ -496,6 +774,9 @@ void Ajustes(AppState& state) {
                     break;
                 case kTabRepetition:
                     TabRepetition(state);
+                    break;
+                case kTabAutoVision:
+                    TabAutoVision(state);
                     break;
                 case kTabOverlay:
                     TabOverlay(state);

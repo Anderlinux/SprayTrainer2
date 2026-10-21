@@ -59,8 +59,23 @@ struct ProfileData {
     int cycleWeaponKeyVk = kDefaultCycleWeaponKeyVk;  // tecla para a próxima arma (0 = desligado)
     int cycleBackKeyVk = kDefaultCycleBackKeyVk;      // tecla para a arma anterior (0 = desligado)
 
+    // Reconhecimento visual automático (seção "autoVision", opcional). Quando
+    // ligado, o app captura a região abaixo e escolhe a arma sozinha — sem F1/F2.
+    bool autoVisionEnabled = false;   // inicia desligado: modo manual é o comportamento padrão
+    int autoRegionX = 0;              // região em pixels de tela (x, y, w, h)
+    int autoRegionY = 0;
+    int autoRegionW = 0;
+    int autoRegionH = 0;
+    std::string autoWindowTitle;      // título da janela monitorada (vazio = região fixa na tela)
+    float autoConfidenceMin = 0.85f;  // confiança mínima (0..1) para aceitar um match
+    int autoIntervalMs = 200;         // intervalo entre verificações (100..2000)
+    int autoConfirmFrames = 3;        // leituras iguais consecutivas antes de trocar (1..10)
+
     bool operator==(const ProfileData& other) const;
 };
+
+// Limite aceito no load/save para tamanho da região (maior que isso é erro de configuração).
+inline constexpr int kMaxAutoRegionSize = 16384;
 
 // Valores de fábrica (padrões de recuo padrão incluídos).
 ProfileData DefaultProfile();

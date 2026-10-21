@@ -172,11 +172,58 @@ StoreResult ProfileStore::Save(const std::string& name, const ProfileData& data)
     return WriteTextAtomic(FileFor(name), ProfileToJson(data));
 }
 
+// ---- Imagens de referência do reconhecimento automático ----
+fs::path ProfileStore::ImagesFileFor(const std::string& name) const {
+    return ProfilesDir() / PathFromUtf8(name + ".images.json");
+}
+
+StoreResult ProfileStore::SaveWeaponImages(const std::string& name,
+                                           const std::vector<WeaponImageEntry>& entries) const {
+    if (const auto err = ValidateName(name)) {
+        return StoreResult::Fail(*err);
+    }
+    if (StoreResult r = EnsureDirs(); !r.ok) {
+        return r;
+    }
+    // Lista vazia: remove o arquivo em vez de deixar um JSON vazio para trás.
+    if (entries.empty()) {
+        std::error_code ec;
+        fs::remove(ImagesFileFor(name), ec);  // melhor esforço; ausência = vazio no load
+        return {};
+    }
+    return WriteTextAtomic(ImagesFileFor(name), WeaponImagesToJson(entries));
+}
+
+StoreResult ProfileStore::LoadWeaponImages(const std::string& name, std::vector<WeaponImageEntry>& out,
+                                           std::vector<std::string>* warnings) const {
+    out.clear();
+    std::string text;
+    if (StoreResult r = ReadText(ImagesFileFor(name), text); !r.ok) {
+        // Arquivo ausente é normal (perfil sem imagens cadastradas): não é erro.
+        std::error_code ec;
+        if (!fs::exists(ImagesFileFor(name), ec)) {
+            return {};
+        }
+        return r;
+    }
+    const WeaponImagesParseResult parsed = WeaponImagesFromJson(text, out);
+    if (!parsed.ok) {
+        return StoreResult::Fail(parsed.warnings.empty() ? "arquivo de imagens inválido"
+                                                          : parsed.warnings.front());
+    }
+    if (warnings != nullptr) {
+        *warnings = parsed.warnings;
+    }
+    return {};
+}
+
 StoreResult ProfileStore::Delete(const std::string& name) const {
     std::error_code ec;
     if (!fs::remove(FileFor(name), ec) || ec) {
         return StoreResult::Fail("não foi possível excluir o perfil \"" + name + "\"");
     }
+    // Remove também o arquivo irmão de imagens (melhor esforço; ausência é normal).
+    fs::remove(ImagesFileFor(name), ec);
     if (LastProfile() == name) {
         SetLastProfile("");
     }
@@ -202,6 +249,13 @@ StoreResult ProfileStore::Rename(const std::string& from, const std::string& to)
     if (ec) {
         return StoreResult::Fail("não foi possível renomear o perfil");
     }
+    // O arquivo irmão de imagens acompanha o rename (melhor esforço: se não
+    // existir — perfil sem imagens — ou falhar, o perfil continua válido).
+    std::error_code ecImg;
+    fs::rename(ImagesFileFor(from), ImagesFileFor(to), ecImg);
+    if (!ecImg && fs::exists(ImagesFileFor(from))) {
+        fs::remove(ImagesFileFor(from), ecImg);  // disco que diferencia maiúsculas: src sobrou
+    }
     if (LastProfile() == from) {
         SetLastProfile(to);
     }
@@ -216,7 +270,15 @@ StoreResult ProfileStore::Duplicate(const std::string& from, const std::string& 
     if (StoreResult r = Load(from, data); !r.ok) {
         return r;
     }
-    return Save(to, data);
+    if (StoreResult r = Save(to, data); !r.ok) {
+        return r;
+    }
+    // Cópia também leva as imagens de referência (se houver).
+    std::vector<WeaponImageEntry> images;
+    if (StoreResult r = LoadWeaponImages(from, images); r.ok && !images.empty()) {
+        return SaveWeaponImages(to, images);
+    }
+    return {};
 }
 
 std::string ProfileStore::LastProfile() const {

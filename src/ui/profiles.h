@@ -38,6 +38,10 @@ void InvalidateList(AppState& state);
 
 void Notify(AppState& state, const std::string& text, bool error = false);
 
+// Imagens de referência do reconhecimento (arquivo irmão <nome>.images.json).
+void SaveImages(AppState& state, const std::string& name);
+void LoadImages(AppState& state, const std::string& name);
+
 // Diálogos de nome, excluir e sair sem salvar (desenhados na janela principal).
 void RenderModals(AppState& state);
 void OpenPrompt(AppState& state, NamePrompt prompt, const std::string& target = {});

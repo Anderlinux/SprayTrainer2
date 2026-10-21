@@ -19,7 +19,7 @@ constexpr float kLabelColumn = 190.0f;
 // Seletor de arma com ícone + nome (o Combo padrão não desenha imagem no preview).
 void WeaponSelector(AppState& state, float width) {
     Weapon w = state.weapon;
-    if (widgets::WeaponDropdown("##weaponSel", state.weaponIcons, &w, width, 1.0f, state.session.Running())) {
+    if (widgets::WeaponDropdown("##weaponSel", state.weaponIcons, state.weaponIconW, state.weaponIconH, &w, width, 1.0f, state.session.Running())) {
         SelectWeapon(state, w);
     }
 }

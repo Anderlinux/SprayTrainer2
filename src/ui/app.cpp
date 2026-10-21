@@ -2,8 +2,11 @@
 
 #include "config/paths_win.h"
 #include "core/repetition.h"
+#include "core/vision/png.h"          // DecodePng (importação de PNG na aba auto)
+#include "platform/win32/capture.h"   // CaptureAppStateRegion / CaptureScreenRegion
 #include "ui/file_dialog.h"
 #include "ui/main_window.h"
+#include "ui/pages.h"                 // g_autoVisionReq (pedidos da aba Auto-Reconhecimento)
 #include "ui/profiles.h"
 #include "ui/theme.h"
 
@@ -19,6 +22,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -89,8 +93,12 @@ App::~App() {
         ClipCursor(nullptr);
     }
     overlay_.Shutdown();
-    for (Texture& tex : state_.weaponIcons) {
-        ReleaseTexture(tex);
+    for (std::size_t i = 0; i < kWeaponCount; ++i) {
+        if (state_.weaponIcons[i] != nullptr) {
+            Texture tex{state_.weaponIcons[i], state_.weaponIconW[i], state_.weaponIconH[i]};
+            ReleaseTexture(tex);
+            state_.weaponIcons[i] = nullptr;
+        }
     }
     if (imgui_ != nullptr) {
         ImGui::SetCurrentContext(imgui_);
@@ -188,7 +196,7 @@ bool App::Init(HINSTANCE instance) {
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;  // layout é fixo; configurações vão para o perfil JSON (Etapa 5)
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    theme::SetAccent(state_.ui.accent);
+    theme::SetAccent(ImVec4(state_.ui.accent.x, state_.ui.accent.y, state_.ui.accent.z, 1.0f));
     theme::Apply();
     dpiScale_ = ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd_);
     ImGui_ImplWin32_Init(hwnd_);
@@ -200,7 +208,13 @@ bool App::Init(HINSTANCE instance) {
                                        IDR_WEAPON_MP7,  IDR_WEAPON_P90,   IDR_WEAPON_BIZON, IDR_WEAPON_SG553,
                                        IDR_WEAPON_UMP45};
     for (std::size_t i = 0; i < kWeaponCount; ++i) {
-        LoadTextureFromResource(device_, iconIds[i], state_.weaponIcons[i]);
+        Texture tex;
+        if (LoadTextureFromResource(device_, iconIds[i], tex)) {
+            // Estado portável guarda só o ponteiro opaco + dimensões (sem imgui).
+            state_.weaponIcons[i] = tex.srv;
+            state_.weaponIconW[i] = tex.width;
+            state_.weaponIconH[i] = tex.height;
+        }
     }
 
     // Overlay: falhar aqui não impede o app de abrir.
@@ -247,6 +261,8 @@ int App::Run() {
         repeater_.SetUiFrameMs(loopFrameMs_);
         state_.nowMs = now;
         TickRepetition(now);
+        HandleAutoVisionRequests();  // prévia/teste/importação pedidos pela aba auto
+        TickAutoVision(now);         // reconhecimento visual (no-op quando desligado)
         if (now - lastMouseCheckMs_ >= kMouseCheckIntervalMs) {
             state_.mouseDetected = AnyMousePresent();
             lastMouseCheckMs_ = now;
@@ -308,6 +324,9 @@ void App::RenderMain(double nowMs) {
     FixMousePosition();
     ImGui::NewFrame();
     state_.maximized = IsZoomed(hwnd_) != FALSE;
+    // Device exposto ao estado: a aba Auto-Reconhecimento cria texturas da
+    // prévia via LoadTextureFromMemory (WIC+DX11) durante o render.
+    state_.dx11Device = device_;
     RenderMainWindow(state_, nowMs);
     ImGui::Render();
     UpdateCursorClip();
@@ -516,6 +535,174 @@ void App::CycleWeaponBack() {
                      static_cast<int>(Weapon::Count);
     state_.weapon = static_cast<Weapon>(prev);
     state_.editorWeapon = state_.weapon;
+}
+
+// Troca direta de arma pelo índice (mesmo efeito dos seletores da UI e do F1/F2:
+// atualiza state_.weapon e o editor; a repetição é reconfigurada no próximo
+// TickRepetition/Start, exatamente como nas trocas manuais).
+void App::SelectWeapon(int weaponIndex) {
+    if (weaponIndex < 0 || weaponIndex >= static_cast<int>(Weapon::Count)) {
+        return;
+    }
+    state_.weapon = static_cast<Weapon>(weaponIndex);
+    state_.editorWeapon = state_.weapon;
+}
+
+void App::TickAutoVision(double nowMs) {
+    // Religou o modo automático? Recarrega templates e esquece o estado antigo.
+    if (state_.autoVision.enabled && !lastAutoVisionEnabled_) {
+        for (const std::string& warn : autoVision_.ReloadTemplatesState(state_)) {
+            state_.autoVisionLastReason = warn;  // primeiro aviso fica visível na UI
+        }
+    }
+    lastAutoVisionEnabled_ = state_.autoVision.enabled;
+
+    // A UI pediu recarga (imagens/região editadas): faz na thread da UI, aqui.
+    if (state_.autoVisionReloadRequest) {
+        state_.autoVisionReloadRequest = false;
+        autoVision_.ReloadTemplatesState(state_);
+    }
+
+    bool switched = false;
+    int weaponIndex = -1;
+    autoVision_.TickState(state_, nowMs, &CaptureAppStateRegion, switched, weaponIndex);
+
+    // Publica o status para a aba "Auto-Reconhecimento" ler durante o render.
+    const AutoVisionController::FrameStatus& fs = autoVision_.Status();
+    state_.autoVisionStatus = static_cast<int>(fs.status);
+    state_.autoVisionConfidence = fs.confidence;
+    state_.autoVisionRecognized = fs.weaponIndex;
+    state_.autoVisionLastSwitchMs = fs.lastSwitchMs;
+    state_.autoVisionCaptureFailed = fs.captureFailed;
+    if (!fs.reason.empty()) {
+        state_.autoVisionLastReason = fs.reason;
+    }
+
+    if (switched) {
+        SelectWeapon(weaponIndex);
+    }
+}
+
+void App::HandleAutoVisionRequests() {
+    // Pedidos vindos da aba "Auto-Reconhecimento" (page_ajustes.cpp desenha a UI;
+    // só o App tem acesso à captura GDI, aos templates carregados e ao diálogo).
+    pages::AutoVisionUiRequests& req = pages::g_autoVisionReq;
+    if (!req.capturePreview && !req.testMatch && req.importWeaponIndex < 0 && req.removeImageIndex < 0) {
+        return;  // nada pendente: não toca em nada (barato por frame)
+    }
+
+    // Prévia e teste usam exatamente a mesma captura da região configurada.
+    AutoVisionController::CaptureResult capture;
+    bool haveCapture = false;
+    if (req.capturePreview || req.testMatch) {
+        capture = CaptureAppStateRegion(state_);
+        haveCapture = capture.ok;
+        if (req.capturePreview) {
+            if (haveCapture) {
+                state_.autoVisionPreviewW = capture.image.width;
+                state_.autoVisionPreviewH = capture.image.height;
+                state_.autoVisionPreviewRgb = std::move(capture.image.rgb);
+                state_.autoVisionLastReason = "Previa capturada (" +
+                                              std::to_string(state_.autoVisionPreviewW) + "x" +
+                                              std::to_string(state_.autoVisionPreviewH) + ").";
+            } else {
+                state_.autoVisionLastReason = "Falha na previa: " + capture.error;
+            }
+        }
+    }
+
+    if (req.testMatch) {
+        state_.autoVisionTestConfidence = -1.0f;
+        state_.autoVisionTestWeaponName.clear();
+        if (!haveCapture) {
+            state_.autoVisionLastReason = "Teste abortado: " + capture.error;
+        } else {
+            const ProfileData view = [&]() {
+                ProfileData p;
+                p.autoVisionEnabled = state_.autoVision.enabled;
+                p.autoRegionX = state_.autoVision.regionX;
+                p.autoRegionY = state_.autoVision.regionY;
+                p.autoRegionW = state_.autoVision.regionW;
+                p.autoRegionH = state_.autoVision.regionH;
+                p.autoWindowTitle = state_.autoVision.windowTitle;
+                p.autoConfidenceMin = state_.autoVision.confidenceMin;
+                p.autoIntervalMs = state_.autoVision.intervalMs;
+                p.autoConfirmFrames = state_.autoVision.confirmFrames;
+                return p;
+            }();
+            float best = -1.0f;
+            int bestWeapon = -1;
+            for (int i = 0; i < static_cast<int>(Weapon::Count); ++i) {
+                const WeaponImageEntry* entry = autoVision_.WeaponImageEntryFor(state_, i);
+                if (entry == nullptr) {
+                    continue;
+                }
+                float conf = 0.0f;
+                if (AutoVisionController::ScoreTemplate(view, entry->pngBase64, capture.image, conf) &&
+                    conf > best) {
+                    best = conf;
+                    bestWeapon = i;
+                }
+            }
+            if (best >= 0.0f) {
+                state_.autoVisionTestConfidence = best;
+                state_.autoVisionTestWeaponName =
+                    best >= state_.autoVision.confidenceMin && bestWeapon >= 0
+                        ? std::string(GetWeaponInfo(static_cast<Weapon>(bestWeapon)).name)
+                        : std::string();
+            }
+            state_.autoVisionLastReason =
+                bestWeapon >= 0 ? "Teste: melhor correspondencia avaliada." : "Teste: nenhuma imagem cadastrada.";
+        }
+    }
+
+    if (req.importWeaponIndex >= 0) {
+        const int wi = req.importWeaponIndex;
+        req.importWeaponIndex = -1;
+        req.importFailed = false;
+        std::vector<unsigned char> png = std::move(req.importedPng);
+        req.importedPng.clear();
+        if (png.empty()) {
+            // Importação via arquivo: diálogo nativo (mesmo padrão dos perfis).
+            if (const auto file = OpenAnyFileDialog(hwnd_)) {
+                std::ifstream in(*file, std::ios::binary);
+                png.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>{});
+            }
+        }
+        ImageRgb decoded;
+        if (png.empty() || !DecodePng(png, decoded) || decoded.Empty() ||
+            decoded.width > state_.autoVision.regionW || decoded.height > state_.autoVision.regionH) {
+            req.importFailed = true;
+        } else {
+            const std::string id(GetWeaponInfo(static_cast<Weapon>(wi)).id);
+            bool found = false;
+            for (WeaponImageEntry& entry : state_.weaponImages) {
+                if (entry.weaponId == id) {
+                    entry.pngBase64 = Base64Encode(png);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                state_.weaponImages.push_back(WeaponImageEntry{id, Base64Encode(png)});
+            }
+            state_.autoVisionReloadRequest = true;  // recarrega templates no próximo tick
+            if (state_.profiles.store != nullptr && !state_.profiles.current.empty()) {
+                profiles::SaveImages(state_, state_.profiles.current);  // persistência imediata
+            }
+        }
+    }
+
+    if (req.removeImageIndex >= 0) {
+        const int wi = req.removeImageIndex;
+        req.removeImageIndex = -1;
+        const std::string id(GetWeaponInfo(static_cast<Weapon>(wi)).id);
+        std::erase_if(state_.weaponImages, [&](const WeaponImageEntry& e) { return e.weaponId == id; });
+        state_.autoVisionReloadRequest = true;
+        if (state_.profiles.store != nullptr && !state_.profiles.current.empty()) {
+            profiles::SaveImages(state_, state_.profiles.current);
+        }
+    }
 }
 
 void App::TickRepetition(double nowMs) {

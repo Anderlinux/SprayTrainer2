@@ -42,8 +42,19 @@ add_library(st_core STATIC
     src/core/weapon.cpp
     src/core/pattern_store.cpp
     src/core/training_session.cpp
+    src/core/vision/auto_picker.cpp
+    src/core/vision/image.cpp
+    src/core/vision/matcher.cpp
+    src/core/vision/png.cpp
+    src/core/vision/weapon_images.cpp
+    # Orquestração do modo automático: pura (captura injetada por função),
+    # testável em Linux; no Windows o App injeta a captura real via BitBlt.
+    src/ui/auto_vision.cpp
 )
 target_include_directories(st_core PUBLIC src)
+# weapon_images usa nlohmann/json para a seção "weaponImages" do perfil.
+# A biblioteca continua portável (sem Win32) — só depende do header-only json.
+target_link_libraries(st_core PUBLIC nlohmann_json::nlohmann_json)
 st_warnings(st_core)
 
 # ------------------------------------------------------------------ perfis (portável)
@@ -61,6 +72,13 @@ if(ST_BUILD_TESTS)
     target_link_libraries(st_core_tests PRIVATE st_core)
     st_warnings(st_core_tests)
     add_test(NAME core COMMAND st_core_tests)
+
+    # Testes do reconhecimento visual automático (downscale, template matching,
+    # máquina de estados anti-repetição e decoder PNG). Núcleo puro, roda em qualquer plataforma.
+    add_executable(st_vision_tests tests/vision_tests.cpp)
+    target_link_libraries(st_vision_tests PRIVATE st_core nlohmann_json::nlohmann_json)
+    st_warnings(st_vision_tests)
+    add_test(NAME vision COMMAND st_vision_tests)
 
     add_executable(st_config_tests tests/config_tests.cpp)
     target_link_libraries(st_config_tests PRIVATE st_config)
@@ -118,6 +136,8 @@ if(WIN32)
         src/ui/page_visual.cpp
         src/ui/pattern_editor.cpp
         src/ui/profiles.cpp
+        src/ui/auto_vision.cpp
+        src/platform/win32/capture.cpp
         src/ui/file_dialog.cpp
         src/ui/spray_plot.cpp
         src/ui/swap_target.cpp

@@ -6,7 +6,27 @@
 #include "core/pattern_store.h"
 #include "core/repetition.h"
 #include "core/training_session.h"
-#include "ui/textures.h"
+#include "core/vision/weapon_images.h"
+// textures.h NÃO entra aqui: ele puxa <d3d11.h>/<imgui.h>, indisponíveis para o
+// núcleo portável (st_core/st_config/testes em Linux). Os campos de textura da
+// UI usam ponteiro opaco, preenchido apenas pelo lado Windows.
+struct ID3D11ShaderResourceView;
+// Mesmo padrão acima: <d3d11.h> indisponível no núcleo portável; declaração
+// prévia basta para o campo de ponteiro (preenchido só pelo lado Windows).
+struct ID3D11Device;
+
+// ImGui também NÃO entra aqui: app_state.h é incluído por st_core (via
+// ui/auto_vision.h), que não tem os include dirs do third_party/imgui. As
+// cores da interface usam esta struct portável; a conversão para ImVec4
+// acontece apenas nos arquivos .cpp da UI (que já incluem <imgui.h>).
+namespace st {
+struct Rgba4 {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float w = 1.0f;
+};
+}  // namespace st
 
 #include <array>
 #include <optional>
@@ -32,7 +52,7 @@ struct OverlaySettings {
 
 // Aparência (aba Ajustes > Interface).
 struct InterfaceSettings {
-    ImVec4 accent{157.0f / 255.0f, 78.0f / 255.0f, 221.0f / 255.0f, 1.0f};  // #9D4EDD
+    Rgba4 accent{157.0f / 255.0f, 78.0f / 255.0f, 221.0f / 255.0f, 1.0f};  // #9D4EDD
     float windowOpacity = 1.0f;                    // 0.6 .. 1.0
     float scale = 1.0f;                            // 0.8 .. 1.5, multiplica a escala do monitor
     float scaleDraft = -1.0f;                      // valor no slider enquanto arrasta (aplica ao soltar)
@@ -58,6 +78,21 @@ struct PatternRecorder {
     TrainingSession session;     // só mede o movimento e o tempo de cada tiro
     std::vector<Vec2> path;      // caminho gravado (modo Review)
     int smoothing = 1;           // 0 a 3
+};
+
+// Reconhecimento visual automático (mesmos campos da seção "autoVision" do perfil).
+// Ligado, o app escolhe a arma sozinho pela imagem na região monitorada — sem F1/F2.
+// Desligado (padrão), tudo continua exatamente como hoje.
+struct AutoVisionSettings {
+    bool enabled = false;
+    int regionX = 0;
+    int regionY = 0;
+    int regionW = 0;
+    int regionH = 0;
+    std::string windowTitle;      // vazio = região fixa em coordenadas de tela
+    float confidenceMin = 0.85f;  // 0..1
+    int intervalMs = 200;         // 100..2000
+    int confirmFrames = 3;        // 1..10
 };
 
 // Configuração da repetição automática (aba Ajustes > Repetição). Os VK são códigos
@@ -116,6 +151,10 @@ struct AppState {
     Weapon weapon = kDefaultWeapon;
     float sensitivity = kDefaultSensitivity;
 
+    // Device DX11 para as texturas da prévia do reconhecimento (injetado pelo
+    // App no RenderMain, antes de desenhar as páginas). Nulo fora do Windows.
+    ID3D11Device* dx11Device = nullptr;
+
     // Tela Principal
     bool trainingEnabled = false;          // interruptor: a área de treino só aceita rajadas ligada
     FireButton fireButton = FireButton::Left;
@@ -134,6 +173,34 @@ struct AppState {
 
     // Repetição automática do padrão (hotkey global; ver App::TickRepetition)
     RepetitionSettings repetition;
+    // Reconhecimento visual automático (aba Ajustes > Auto-Reconhecimento).
+    // As imagens de referência ficam em state_.weaponImages (seção "weaponImages").
+    AutoVisionSettings autoVision;
+    std::vector<WeaponImageEntry> weaponImages;
+    // Pedido da aba "Auto-Reconhecimento" para o App recarregar os templates do
+    // AutoVisionController no próximo tick (desenhado na thread da UI, aplicado
+    // fora dela — padrão do projeto).
+    bool autoVisionReloadRequest = false;
+    // Status publicado pelo App::TickAutoVision a cada frame; lido pela aba
+    // "Auto-Reconhecimento" durante o render (copia simples, mesma thread).
+    int autoVisionStatus = 0;              // valor de AutoPicker::Status como int
+    float autoVisionConfidence = 0.0f;     // confiança da última decisão
+    int autoVisionRecognized = -1;         // arma reconhecida agora (-1 = nenhuma)
+    double autoVisionLastSwitchMs = -1.0e9;  // relógio do app na última troca confirmada
+    bool autoVisionCaptureFailed = false;  // última captura falhou (janela fechada etc.)
+    std::string autoVisionLastReason;      // motivo legível da última decisão/rejeição
+    // Prévia "Capturar agora" (aba Auto-Reconhecimento): o App preenche com a
+    // imagem capturada e as dimensões no pedido feito pela UI (thread da UI).
+    int autoVisionPreviewW = 0;
+    int autoVisionPreviewH = 0;
+    std::vector<std::uint8_t> autoVisionPreviewRgb;  // RGB24, tamanho w*h*3 (vazio = sem prévia)
+    // Prévia do template cadastrado: id da arma ("ak47") + bytes PNG originais.
+    std::string autoVisionTemplateId;
+    std::vector<std::uint8_t> autoVisionTemplatePng;
+    // Resultado do teste manual "Testar agora" (aba Auto-Reconhecimento):
+    // confiança da melhor batida e nome da arma correspondente (vazio = nenhuma).
+    float autoVisionTestConfidence = -1.0f;
+    std::string autoVisionTestWeaponName;
     bool repeatArmed = true;                 // false até a tecla de atalho ser solta
     int repeatHotkeyId = 0;                  // hotkey global registrada (0 = nenhuma)
     std::vector<int> registeredStopKeys{};   // VKs realmente registrados no Windows
@@ -146,7 +213,13 @@ struct AppState {
     int repetitionShot = 0;                  // tiros já iniciados no ciclo atual
     int repetitionShotsTotal = 0;            // total de tiros do padrão da arma
 
-    std::array<Texture, kWeaponCount> weaponIcons{};
+    // Texturas das armas: mantidas como ponteiro opaco (ID3D11ShaderResourceView)
+    // para que este header compile no núcleo portável sem d3d11/imgui. As
+    // dimensões ficam em arrays paralelos; o ciclo de vida é gerenciado pelo App
+    // via ReleaseTexture no lado Win32 (ver app.cpp, que usa st::Texture*).
+    std::array<ID3D11ShaderResourceView*, kWeaponCount> weaponIcons{};
+    std::array<float, kWeaponCount> weaponIconW{};  // largura do ícone (px)
+    std::array<float, kWeaponCount> weaponIconH{};  // altura do ícone (px)
 
     OverlaySettings overlay;
     bool overlayExpanded = true;     // painel aberto por padrão: o replay é o foco principal
