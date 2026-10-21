@@ -89,8 +89,12 @@ App::~App() {
         ClipCursor(nullptr);
     }
     overlay_.Shutdown();
-    for (Texture& tex : state_.weaponIcons) {
-        ReleaseTexture(tex);
+    for (std::size_t i = 0; i < kWeaponCount; ++i) {
+        if (state_.weaponIcons[i] != nullptr) {
+            Texture tex{state_.weaponIcons[i], state_.weaponIconW[i], state_.weaponIconH[i]};
+            ReleaseTexture(tex);
+            state_.weaponIcons[i] = nullptr;
+        }
     }
     if (imgui_ != nullptr) {
         ImGui::SetCurrentContext(imgui_);
@@ -200,7 +204,13 @@ bool App::Init(HINSTANCE instance) {
                                        IDR_WEAPON_MP7,  IDR_WEAPON_P90,   IDR_WEAPON_BIZON, IDR_WEAPON_SG553,
                                        IDR_WEAPON_UMP45};
     for (std::size_t i = 0; i < kWeaponCount; ++i) {
-        LoadTextureFromResource(device_, iconIds[i], state_.weaponIcons[i]);
+        Texture tex;
+        if (LoadTextureFromResource(device_, iconIds[i], tex)) {
+            // Estado portável guarda só o ponteiro opaco + dimensões (sem imgui).
+            state_.weaponIcons[i] = tex.srv;
+            state_.weaponIconW[i] = tex.width;
+            state_.weaponIconH[i] = tex.height;
+        }
     }
 
     // Overlay: falhar aqui não impede o app de abrir.

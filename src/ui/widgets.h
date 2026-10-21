@@ -29,12 +29,18 @@ void WeaponIcon(ImDrawList* dl, const Texture& tex, ImVec2 boxPos, ImVec2 boxSiz
 // Linha de botões mutuamente exclusivos; devolve true se a seleção mudou.
 bool Segmented(const char* id, const char* const* labels, int count, int* current, ImVec2 size);
 
+// Ícones chegam como ponteiros opacos + dimensões paralelas porque o estado da
+// UI (AppState) não pode incluir d3d11/imgui (compila no núcleo portável).
 // Três blocos (ícone + nome) para escolher a arma; devolve true se mudou.
-bool WeaponTiles(const char* id, const std::array<Texture, kWeaponCount>& icons, Weapon* current, float width,
+bool WeaponTiles(const char* id, const std::array<ID3D11ShaderResourceView*, kWeaponCount>& srvs,
+                 const std::array<float, kWeaponCount>& ws, const std::array<float, kWeaponCount>& hs,
+                 Weapon* current, float width,
                  float scale, bool disabled, int columns = 4);
 
 // Lista suspensa de armas com silhueta + nome (rolável). Devolve true se a escolha mudou.
-bool WeaponDropdown(const char* id, const std::array<Texture, kWeaponCount>& icons, Weapon* current, float width,
+bool WeaponDropdown(const char* id, const std::array<ID3D11ShaderResourceView*, kWeaponCount>& srvs,
+                    const std::array<float, kWeaponCount>& ws, const std::array<float, kWeaponCount>& hs,
+                    Weapon* current, float width,
                     float scale, bool disabled);
 
 // Linha de configuração em tabela de 2 colunas: rótulo em negrito + ajuda à esquerda,

@@ -154,7 +154,9 @@ bool Segmented(const char* id, const char* const* labels, int count, int* curren
     return changed;
 }
 
-bool WeaponTiles(const char* id, const std::array<Texture, kWeaponCount>& icons, Weapon* current, float width,
+bool WeaponTiles(const char* id, const std::array<ID3D11ShaderResourceView*, kWeaponCount>& srvs,
+                 const std::array<float, kWeaponCount>& ws, const std::array<float, kWeaponCount>& hs,
+                 Weapon* current, float width,
                  float scale, bool disabled, int columns) {
     // Grade com `columns` colunas, posicionada a partir da origem.
     const std::size_t kColumns = static_cast<std::size_t>(std::max(columns, 1));
@@ -185,7 +187,7 @@ bool WeaponTiles(const char* id, const std::array<Texture, kWeaponCount>& icons,
         const ImVec2 end(pos.x + w, pos.y + h);
         dl->AddRectFilled(pos, end, theme::U32(hovered ? ImVec4(0.14f, 0.14f, 0.14f, 1.0f) : theme::kPanelAlt), 8.0f);
         dl->AddRect(pos, end, theme::U32(active ? theme::Accent() : theme::kBorder), 8.0f, 0, active ? 2.0f : 1.0f);
-        WeaponIcon(dl, icons[i], ImVec2(pos.x + 8.0f * k, pos.y + 8.0f * k), ImVec2(w - 16.0f * k, 22.0f * k));
+        WeaponIcon(dl, Texture{srvs[i], ws[i], hs[i]}, ImVec2(pos.x + 8.0f * k, pos.y + 8.0f * k), ImVec2(w - 16.0f * k, 22.0f * k));
         ImGui::PushFont(theme::Fonts().caption);
         const char* name = GetWeaponInfo(weapon).name.data();
         const ImVec2 ts = ImGui::CalcTextSize(name);
@@ -200,7 +202,9 @@ bool WeaponTiles(const char* id, const std::array<Texture, kWeaponCount>& icons,
     return changed;
 }
 
-bool WeaponDropdown(const char* id, const std::array<Texture, kWeaponCount>& icons, Weapon* current, float width,
+bool WeaponDropdown(const char* id, const std::array<ID3D11ShaderResourceView*, kWeaponCount>& srvs,
+                    const std::array<float, kWeaponCount>& ws, const std::array<float, kWeaponCount>& hs,
+                    Weapon* current, float width,
                     float scale, bool disabled) {
     const float k = scale;
     const float height = 40.0f * k;
@@ -216,7 +220,7 @@ bool WeaponDropdown(const char* id, const std::array<Texture, kWeaponCount>& ico
     const ImVec2 end(pos.x + width, pos.y + height);
     dl->AddRectFilled(pos, end, theme::U32(hovered ? ImVec4(0.14f, 0.14f, 0.14f, 1.0f) : theme::kPanelAlt), 8.0f);
     dl->AddRect(pos, end, theme::U32(theme::kBorder), 8.0f);
-    WeaponIcon(dl, icons[Index(*current)], ImVec2(pos.x + 12.0f * k, pos.y + (height - iconBox.y) * 0.5f), iconBox);
+    WeaponIcon(dl, Texture{srvs[Index(*current)], ws[Index(*current)], hs[Index(*current)]}, ImVec2(pos.x + 12.0f * k, pos.y + (height - iconBox.y) * 0.5f), iconBox);
     ImGui::PushFont(theme::Fonts().bold);
     const float fs = ImGui::GetFontSize();
     const float textX = pos.x + 12.0f * k + iconBox.x + 14.0f * k;
@@ -249,7 +253,7 @@ bool WeaponDropdown(const char* id, const std::array<Texture, kWeaponCount>& ico
                 ImGui::SetScrollHereY();
             }
             ImDrawList* pdl = ImGui::GetWindowDrawList();
-            WeaponIcon(pdl, icons[i], ImVec2(rowPos.x + 6.0f * k, rowPos.y + (rowH - iconBox.y) * 0.5f), iconBox);
+            WeaponIcon(pdl, Texture{srvs[i], ws[i], hs[i]}, ImVec2(rowPos.x + 6.0f * k, rowPos.y + (rowH - iconBox.y) * 0.5f), iconBox);
             pdl->AddText(ImGui::GetFont(), fs, ImVec2(rowPos.x + 6.0f * k + iconBox.x + 14.0f * k, rowPos.y + (rowH - fs) * 0.5f),
                          theme::U32(theme::kText), GetWeaponInfo(w).name.data());
             ImGui::PopID();

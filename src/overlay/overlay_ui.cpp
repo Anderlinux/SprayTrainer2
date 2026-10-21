@@ -60,7 +60,7 @@ OverlayUiResult Compact(AppState& state, float k) {
     const ImVec2 size = ImGui::GetWindowSize();
 
     const ImVec2 iconBox(70.0f * k, 22.0f * k);
-    widgets::WeaponIcon(dl, state.weaponIcons[Index(state.weapon)], ImVec2(o.x + 14.0f * k, o.y + 14.0f * k), iconBox);
+    widgets::WeaponIcon(dl, Texture{state.weaponIcons[Index(state.weapon)], state.weaponIconW[Index(state.weapon)], state.weaponIconH[Index(state.weapon)]}, ImVec2(o.x + 14.0f * k, o.y + 14.0f * k), iconBox);
 
     ImGui::PushFont(theme::Fonts().bold);
     const float fs = ImGui::GetFontSize();
@@ -161,7 +161,9 @@ OverlayUiResult Expanded(AppState& state, float k) {
     const float pad = 16.0f * k;
 
     // Cabeçalho
-    widgets::WeaponIcon(dl, state.weaponIcons[Index(state.weapon)], ImVec2(o.x + pad, o.y + pad),
+    widgets::WeaponIcon(dl, Texture{state.weaponIcons[Index(state.weapon)], state.weaponIconW[Index(state.weapon)],
+                                    state.weaponIconH[Index(state.weapon)]},
+                        ImVec2(o.x + pad, o.y + pad),
                         ImVec2(70.0f * k, 22.0f * k));
     ImGui::PushFont(theme::Fonts().bold);
     dl->AddText(ImGui::GetFont(), ImGui::GetFontSize(), ImVec2(o.x + pad + 80.0f * k, o.y + pad + 2.0f * k),
@@ -200,7 +202,7 @@ OverlayUiResult Expanded(AppState& state, float k) {
     // A janela do overlay não tem padding: cada bloco começa na margem manualmente.
     ImGui::SetCursorScreenPos(ImVec2(o.x + pad, ImGui::GetCursorScreenPos().y));
     Weapon w = state.weapon;
-    if (widgets::WeaponDropdown("##ovWeapon", state.weaponIcons, &w, fullW, k, state.session.Running())) {
+    if (widgets::WeaponDropdown("##ovWeapon", state.weaponIcons, state.weaponIconW, state.weaponIconH, &w, fullW, k, state.session.Running())) {
         SelectWeapon(state, w);
     }
 

@@ -7,7 +7,10 @@
 #include "core/repetition.h"
 #include "core/training_session.h"
 #include "core/vision/weapon_images.h"
-#include "ui/textures.h"
+// textures.h NÃO entra aqui: ele puxa <d3d11.h>/<imgui.h>, indisponíveis para o
+// núcleo portável (st_core/st_config/testes em Linux). Os campos de textura da
+// UI usam ponteiro opaco, preenchido apenas pelo lado Windows.
+struct ID3D11ShaderResourceView;
 
 #include <array>
 #include <optional>
@@ -170,7 +173,13 @@ struct AppState {
     int repetitionShot = 0;                  // tiros já iniciados no ciclo atual
     int repetitionShotsTotal = 0;            // total de tiros do padrão da arma
 
-    std::array<Texture, kWeaponCount> weaponIcons{};
+    // Texturas das armas: mantidas como ponteiro opaco (ID3D11ShaderResourceView)
+    // para que este header compile no núcleo portável sem d3d11/imgui. As
+    // dimensões ficam em arrays paralelos; o ciclo de vida é gerenciado pelo App
+    // via ReleaseTexture no lado Win32 (ver app.cpp, que usa st::Texture*).
+    std::array<ID3D11ShaderResourceView*, kWeaponCount> weaponIcons{};
+    std::array<float, kWeaponCount> weaponIconW{};  // largura do ícone (px)
+    std::array<float, kWeaponCount> weaponIconH{};  // altura do ícone (px)
 
     OverlaySettings overlay;
     bool overlayExpanded = true;     // painel aberto por padrão: o replay é o foco principal

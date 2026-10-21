@@ -59,7 +59,7 @@ void TabPatterns(AppState& state) {
 
     const float tilesW = ImGui::GetContentRegionAvail().x;
     Weapon w = state.editorWeapon;
-    if (widgets::WeaponTiles("##editorWeapon", state.weaponIcons, &w, tilesW, 0.9f, false, 7)) {
+    if (widgets::WeaponTiles("##editorWeapon", state.weaponIcons, state.weaponIconW, state.weaponIconH, &w, tilesW, 0.9f, false, 7)) {
         state.editorWeapon = w;
         state.editorRow = -1;
     }
