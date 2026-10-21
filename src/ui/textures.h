@@ -17,6 +17,9 @@ struct Texture {
 // Decodifica um PNG embutido como RCDATA (via WIC) e cria a textura DX11.
 // Exige COM inicializado na thread.
 bool LoadTextureFromResource(ID3D11Device* device, int resourceId, Texture& out);
+// Mesma decodificação WIC+DX11, a partir de um PNG em memória (prévia do
+// reconhecimento: imagens cadastradas e última captura).
+bool LoadTextureFromMemory(ID3D11Device* device, const unsigned char* data, std::size_t size, Texture& out);
 void ReleaseTexture(Texture& tex);
 
 }  // namespace st

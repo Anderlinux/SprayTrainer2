@@ -154,6 +154,10 @@ struct AppState {
     // As imagens de referência ficam em state_.weaponImages (seção "weaponImages").
     AutoVisionSettings autoVision;
     std::vector<WeaponImageEntry> weaponImages;
+    // Pedido da aba "Auto-Reconhecimento" para o App recarregar os templates do
+    // AutoVisionController no próximo tick (desenhado na thread da UI, aplicado
+    // fora dela — padrão do projeto).
+    bool autoVisionReloadRequest = false;
     bool repeatArmed = true;                 // false até a tecla de atalho ser solta
     int repeatHotkeyId = 0;                  // hotkey global registrada (0 = nenhuma)
     std::vector<int> registeredStopKeys{};   // VKs realmente registrados no Windows

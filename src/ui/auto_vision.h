@@ -1,6 +1,10 @@
 #pragma once
 
 #include "config/profile.h"
+
+#include <string>
+#include <vector>
+
 #include "core/vision/auto_picker.h"
 #include "core/vision/image.h"
 #include "core/vision/matcher.h"
@@ -49,6 +53,14 @@ public:
     // `outWeaponIndex` (transição confirmada pelo AutoPicker).
     void Tick(const ProfileData& profile, double nowMs, CaptureResult (*capture)(const ProfileData&),
               bool& outSwitched, int& outWeaponIndex);
+
+    // Versão que lê a configuração direto do estado da UI (AppState::autoVision):
+    // evita cópias e mantém uma única fonte de verdade na thread da UI.
+    void TickState(const AppState& state, double nowMs, CaptureResult (*capture)(const AppState&),
+                   bool& outSwitched, int& outWeaponIndex);
+
+    // Recarrega templates a partir do estado da UI (weaponImages + região).
+    std::vector<std::string> ReloadTemplatesState(const AppState& state);
 
     const FrameStatus& Status() const { return status_; }
     // Última imagem capturada com sucesso (para prévia na UI). Vazia se nunca.

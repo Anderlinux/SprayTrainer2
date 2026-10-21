@@ -3,7 +3,30 @@
 #include "core/vision/png.h"
 #include "core/weapon.h"
 
+#include <algorithm>
+
 namespace st {
+
+// Copia os campos de AutoVisionSettings (estado da UI) para ProfileData, que é
+// a moeda usada pelo controller e pela captura. Manter uma única cópia na UI e
+// derivar daqui evita dessincronizar perfil x estado em tempo real.
+static ProfileData AutoProfileView(const AppState& state) {
+    ProfileData p;
+    p.autoVisionEnabled = state.autoVision.enabled;
+    p.autoRegionX = state.autoVision.regionX;
+    p.autoRegionY = state.autoVision.regionY;
+    p.autoRegionW = state.autoVision.regionW;
+    p.autoRegionH = state.autoVision.regionH;
+    p.autoWindowTitle = state.autoVision.windowTitle;
+    p.autoConfidenceMin = state.autoVision.confidenceMin;
+    p.autoIntervalMs = state.autoVision.intervalMs;
+    p.autoConfirmFrames = state.autoVision.confirmFrames;
+    return p;
+}
+
+std::vector<std::string> AutoVisionController::ReloadTemplatesState(const AppState& state) {
+    return ReloadTemplates(AutoProfileView(state), state.weaponImages);
+}
 
 std::vector<std::string> AutoVisionController::ReloadTemplates(
     const ProfileData& profile, const std::vector<WeaponImageEntry>& entries) {
@@ -137,6 +160,23 @@ void AutoVisionController::Tick(const ProfileData& profile, double nowMs,
         outSwitched = true;
         outWeaponIndex = decision.weaponIndex;
     }
+}
+
+void AutoVisionController::TickState(const AppState& state, double nowMs,
+                                     CaptureResult (*capture)(const AppState&), bool& outSwitched,
+                                     int& outWeaponIndex) {
+    const ProfileData profile = AutoProfileView(state);
+    // A captura precisa ver o MESMO estado (região/título de janela) usado agora.
+    struct Ctx {
+        CaptureResult (*fn)(const AppState&);
+        const AppState* state;
+    };
+    static thread_local Ctx ctx{nullptr, nullptr};
+    ctx.fn = capture;
+    ctx.state = &state;
+    Tick(profile, nowMs,
+         [](const ProfileData&) -> CaptureResult { return ctx.fn(*ctx.state); }, outSwitched,
+         outWeaponIndex);
 }
 
 void AutoVisionController::Reset() {
