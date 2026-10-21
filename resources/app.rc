@@ -1,0 +1,42 @@
+#include <winver.h>
+
+#include "resource.h"
+
+IDI_APP ICON "app.ico"
+
+IDR_WEAPON_AK47  RCDATA "weapons/ak47.png"
+IDR_WEAPON_M4A4  RCDATA "weapons/m4a4.png"
+IDR_WEAPON_M4A1S RCDATA "weapons/m4a1s.png"
+IDR_WEAPON_FAMAS   RCDATA "weapons/famas.png"
+IDR_WEAPON_GALILAR RCDATA "weapons/galilar.png"
+IDR_WEAPON_MAC10   RCDATA "weapons/mac10.png"
+IDR_WEAPON_MP9     RCDATA "weapons/mp9.png"
+IDR_WEAPON_MP5SD   RCDATA "weapons/mp5sd.png"
+IDR_WEAPON_MP7     RCDATA "weapons/mp7.png"
+IDR_WEAPON_P90     RCDATA "weapons/p90.png"
+IDR_WEAPON_BIZON   RCDATA "weapons/bizon.png"
+IDR_WEAPON_SG553   RCDATA "weapons/sg553.png"
+IDR_WEAPON_UMP45   RCDATA "weapons/ump45.png"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 1, 0, 0, 0
+PRODUCTVERSION 1, 0, 0, 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "041604B0"
+        BEGIN
+            VALUE "FileDescription", "Spray Trainer - treinador offline de controle de spray"
+            VALUE "FileVersion", "1.0.0"
+            VALUE "ProductName", "Spray Trainer"
+            VALUE "ProductVersion", "1.0.0"
+            VALUE "OriginalFilename", "SprayTrainer.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0416, 1200
+    END
+END

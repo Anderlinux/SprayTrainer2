@@ -1,0 +1,172 @@
+diff --git a/src/config/profile.cpp b/src/config/profile.cpp
+index dfc25da..02bb204 100644
+--- a/src/config/profile.cpp
++++ b/src/config/profile.cpp
+@@ -484,6 +484,13 @@ ParseResult ProfileFromJson(const std::string& text, ProfileData& out) {
+                         rd.Error("repetition.stopKeys", "tecla desconhecida \"" + name.get<std::string>() + "\"");
+                         break;
+                     }
++                    // Migração silenciosa: perfis antigos salvos antes da separação
++                    // LBUTTON/KEY1 tinham "1" na lista de desativar — isso fazia o
++                    // toque em "1" apenas RELIGAR a trava e nunca ligar o replay.
++                    // "1" agora é exclusivamente a tecla de religar, então some da lista.
++                    if (vk == kDefaultEnableKeyVk) {
++                        continue;
++                    }
+                     d.stopKeysVk.push_back(vk);
+                 }
+             }
+diff --git a/src/ui/app.cpp b/src/ui/app.cpp
+index b3fd087..721b11c 100644
+--- a/src/ui/app.cpp
++++ b/src/ui/app.cpp
+@@ -385,16 +385,14 @@ void App::SyncRepetitionKeys() {
+         state_.profiles.bannerUntilMs = 1.0e300;
+     }
+ 
+-    // Hotkey FIXA da tecla de religar ("1", kDefaultEnableKeyVk): sempre
+-    // registrada, independentemente da tecla de disparo configurada. É ela que
+-    // limpa a trava deixada por uma tecla de desativar. O handler compara pelo
+-    // VK da mensagem (e não só pelo id), porque a tecla "1" pode estar também na
+-    // lista de desativar — nesse caso o mesmo WM_HOTKEY chega com outro id.
+-    // Se "1" for também a tecla de disparo escolhida pelo usuário, o registro
+-    // abaixo é redundante (kRepeatHotkeyId já cobre) e falha silenciosamente.
+-    if (r.repeatKeyVk != kDefaultEnableKeyVk) {
+-        RegisterHotKey(hwnd_, kEnableHotkeyId, MOD_NOREPEAT, static_cast<UINT>(kDefaultEnableKeyVk));
+-    }
++    // Hotkey FIXA da tecla de religar ("1", kDefaultEnableKeyVk): SEMPRE
++    // registrada, independentemente das demais configurações. É ela que limpa a
++    // trava deixada por uma tecla de desativar e liga o replay de volta.
++    // (Correção do bug "key2 desliga, key1 não religa": antes, se "1" estivesse
++    // na lista de desativar — comum em perfis antigos salvos antes da separação
++    // LBUTTON/KEY1 — a hotkey fixa era pulada e o toque em "1" apenas RELIGAVA
++    // a trava, sem disparar nada. Agora o handler trata "1" com prioridade.)
++    RegisterHotKey(hwnd_, kEnableHotkeyId, MOD_NOREPEAT, static_cast<UINT>(kDefaultEnableKeyVk));
+ 
+     // Várias teclas para desativar. Botões do mouse não podem ser hotkey global
+     // (RegisterHotKey os rejeita), então ficam vigiados por GetAsyncKeyState.
+@@ -403,6 +401,9 @@ void App::SyncRepetitionKeys() {
+     // o índice, "2" ocupando a posição 1 depois de um botão na posição 0 seria
+     // registrado com o mesmo ID da tecla de ATIVAR — e o toque em "2" religaria
+     // o replay em vez de desligar (bug relatado: clicar em atirar religava tudo).
++    // A tecla fixa de religar ("1") NUNCA é registrada como desativar — se um
++    // perfil antigo a tiver na lista, ela é ignorada aqui e vira exclusivamente
++    // a tecla de religar (comportamento pedido: "1" sempre ativa).
+     int stopHotkeySlot = 0;
+     for (std::size_t i = 0; i < r.stopKeysVk.size() && i < kMaxStopKeys; ++i) {
+         const int vk = r.stopKeysVk[i];
+@@ -504,6 +505,10 @@ void App::TickRepetition(double nowMs) {
+         repDisabledByStopKey_ = true;
+         state_.repeatArmed = !IsMouseButtonVk(state_.repetition.repeatKeyVk);
+         state_.repeatToggledOn = false;
++        // Anti-retrigger da tecla física: se "1" foi tocada para DESLIGAR (perfil
++        // antigo em que ela é a tecla de disparo/desativar), segurar ou pressionar
++        // de novo não pode religar na sequência — só um toque limpo depois de solta.
++        enableKeyDownPrev_ = (GetAsyncKeyState(kDefaultEnableKeyVk) & 0x8000) != 0;
+     }
+     // Polling das teclas de DESATIVAR: basta UM clique (borda de subida). Não há
+     // mais bloqueio "enquanto segurada" — o replay para na hora do toque e a tecla
+@@ -515,8 +520,8 @@ void App::TickRepetition(double nowMs) {
+             continue;
+         }
+         stopDown[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
+-        if (stopDown[vk] && !stopKeyDownPrev_[vk]) {
+-            stopClicked = true;
++        if (stopDown[vk] && !stopKeyDownPrev_[vk] && vk != kDefaultEnableKeyVk) {
++            stopClicked = true;  // a tecla fixa de religar nunca desativa (ver SyncRepetitionKeys)
+         }
+     }
+     stopKeyDownPrev_ = stopDown;
+@@ -528,6 +533,39 @@ void App::TickRepetition(double nowMs) {
+         repDisabledByStopKey_ = true;
+         state_.repeatArmed = !IsMouseButtonVk(state_.repetition.repeatKeyVk);
+         state_.repeatToggledOn = false;
++        enableKeyDownPrev_ = (GetAsyncKeyState(kDefaultEnableKeyVk) & 0x8000) != 0;
++    }
++
++    // Polling da tecla de religar ("1"): COBRE O CASO EM QUE O APP ESTÁ EM
++    // SEGUNDO PLANO E A JANELA NÃO ESTÁ PROCESSANDO MENSAGENS (o WM_HOTKEY fica
++    // na fila e só é tratado quando a janela recebe mensagens de novo — em jogo
++    // fullscreen exclusivo isso pode demorar ou parecer que "não aconteceu").
++    // GetAsyncKeyState enxerga o toque mesmo sem foco: borda de subida em "1"
++    // destrava a trava deixada por uma tecla de desativar e liga o replay na
++    // hora. Em primeiro plano, o WM_HOTKEY costuma chegar antes deste polling e
++    // a flag já estará limpa — as duas rotinas são idempotentes entre si.
++    if (repDisabledByStopKey_ && state_.repetition.enabled) {
++        const bool enDown = (GetAsyncKeyState(kDefaultEnableKeyVk) & 0x8000) != 0;
++        if (enDown && !enableKeyDownPrev_) {
++            // Toque em "1": destrava e RELIGA imediatamente (não exige clique extra).
++            repDisabledByStopKey_ = false;
++            enableKeyDownPrev_ = true;  // anti-retrigger até a tecla ser solta
++            if (state_.session.Running()) {
++                state_.session.Stop(nowMs);
++            }
++            repeater_.Stop(nowMs, /*returnBack=*/false);
++            repeater_.Configure(state_.weapon, state_.patterns.Get(state_.weapon),
++                                state_.sensitivity, state_.repetition.substeps);
++            repeater_.Start(nowMs);
++            state_.repeatToggledOn = true;
++            state_.repeatArmed = false;  // rearma ao soltar / próximo toque
++        } else if (!enDown) {
++            enableKeyDownPrev_ = false;  // tecla solta: pronta para o próximo toque
++        }
++    } else {
++        // Fora do modo travado: apenas acompanha o estado físico da tecla para a
++        // detecção de borda não disparar sozinha ao sair da trava.
++        enableKeyDownPrev_ = (GetAsyncKeyState(kDefaultEnableKeyVk) & 0x8000) != 0;
+     }
+ 
+     // Teclas de alternar armas por polling: cobrem botões do mouse (sem WM_HOTKEY).
+@@ -877,16 +915,34 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+             // do registro; lParam traz o VK + scan code (MOD_NOREPEAT garante um
+             // evento por pressionar, sem auto-repeat do teclado).
+             const int vk = static_cast<int>(lParam & 0xFFFF);
+-            if (vk == kDefaultEnableKeyVk) {
++            if (vk == kDefaultEnableKeyVk || wParam == kEnableHotkeyId) {
+                 // Toque na tecla "1" (arma principal no jogo): SEMPRE tem
+-                // prioridade — limpa a trava deixada por uma tecla de desativar
+-                // e religa o replay. Chega tanto pelo id fixo kEnableHotkeyId
+-                // quanto, se o usuário configurou "1" como tecla de disparo,
+-                // pelo kRepeatHotkeyId; por isso a comparação é pelo VK.
++                // prioridade sobre qualquer outra interpretação (disparo ou
++                // desativar) — limpa a trava deixada por uma tecla de desativar
++                // e RELIGA o replay imediatamente, começando do zero quando
++                // "recomeçar do início" estiver ligado. A comparação é pelo VK
++                // para funcionar também quando "1" veio pelo kRepeatHotkeyId
++                // (perfis antigos em que ela era a tecla de disparo).
+                 if (!state_.repetition.enabled) {
+                     break;
+                 }
++                const bool wasBlocked = repDisabledByStopKey_;
+                 repDisabledByStopKey_ = false;
++                enableKeyDownPrev_ = true;  // anti-retrigger até a tecla ser solta
++                if (wasBlocked) {
++                    // Estava travada por uma tecla de desativar: "1" destrava E já
++                    // liga o replay na hora (não exige um clique extra em atirar).
++                    if (state_.session.Running()) {
++                        state_.session.Stop(NowMs());
++                    }
++                    repeater_.Stop(NowMs(), /*returnBack=*/false);
++                    repeater_.Configure(state_.weapon, state_.patterns.Get(state_.weapon),
++                                        state_.sensitivity, state_.repetition.substeps);
++                    repeater_.Start(NowMs());
++                    state_.repeatToggledOn = true;
++                    state_.repeatArmed = false;  // rearma ao soltar (Hold) / próximo toque (Toggle)
++                    break;
++                }
+                 if (state_.repetition.activation == RepeatActivation::Toggle) {
+                     // Toque liga/desliga a repetição contínua.
+                     state_.repeatToggledOn = !state_.repeatToggledOn;
+diff --git a/src/ui/app.h b/src/ui/app.h
+index aa97fc4..7ca8032 100644
+--- a/src/ui/app.h
++++ b/src/ui/app.h
+@@ -90,6 +90,8 @@ private:
+     bool repDisabledByStopKey_ = false;  // true após toque em tecla de desativar: bloqueia
+                                          // reativação pelo mouse/botão; só a tecla "1" religa
+     std::array<bool, 256> stopKeyDownPrev_{};  // estado anterior do polling das teclas de desativar
++    bool enableKeyDownPrev_ = false;  // borda de subida da tecla "1": religa por UM toque
++                                      // quando ela é a própria tecla de disparo (perfil antigo)
+ 
+     AppState state_;
+     MouseRing mouse_;
