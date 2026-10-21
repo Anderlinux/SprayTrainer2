@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config/profile.h"
+#include "ui/app_state.h"  // AppState (usado por referência nos APIs State)
 
 #include <string>
 #include <vector>
@@ -9,9 +10,6 @@
 #include "core/vision/image.h"
 #include "core/vision/matcher.h"
 #include "core/vision/weapon_images.h"
-
-#include <string>
-#include <vector>
 
 namespace st {
 
