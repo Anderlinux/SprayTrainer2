@@ -10,8 +10,11 @@
 #include <algorithm>
 #include <ctime>
 #include <cfloat>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <string>
+#include <vector>
 
 namespace st::profiles {
 

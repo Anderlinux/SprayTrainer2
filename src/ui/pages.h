@@ -5,6 +5,8 @@
 // Aba "Auto-Reconhecimento" (Ajustes): a UI é desenhada dentro do contexto ImGui
 // do App; em vez de encadear ponteiros, as páginas publicam aqui os pedidos que
 // só o App pode executar (captura com GDI/DX11, decoder PNG, textures).
+namespace st::pages {
+
 struct AutoVisionUiRequests {
     bool capturePreview = false;   // prévia da região configurada
     bool testMatch = false;        // captura + comparação imediata (não troca arma)
