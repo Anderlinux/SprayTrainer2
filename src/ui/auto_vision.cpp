@@ -223,7 +223,7 @@ bool AutoVisionController::ScoreTemplate(const ProfileData& profile, const std::
     if (decoded.width > referenceSize.width || decoded.height > referenceSize.height) {
         return false;  // template maior que a imagem realmente capturada
     }
-    WeaponTemplate t;
+    TemplateMatcher::WeaponTemplate t;
     t.weaponIndex = 0;  // índice irrelevante: só a batida importa aqui
     t.image = std::move(decoded);
     matcher.Build(referenceSize, {std::move(t)});
