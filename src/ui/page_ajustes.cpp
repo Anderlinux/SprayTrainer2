@@ -20,6 +20,11 @@
 
 namespace st::pages {
 
+// Tipos do projeto usados direto nesta página (a UI roda dentro de `st`): sem
+// isto, MSVC não resolve SaveCurrent/AutoVisionController/ListTopLevelWindowTitles.
+using namespace st;
+using st::profiles::SaveCurrent;  // declarado em namespace aninhado (não vem do using acima)
+
 // Canal pedido->App declarado em pages.h (a página desenha dentro do contexto
 // ImGui do App, mas só o App pode capturar tela/decodificar PNG/carregar texturas).
 AutoVisionUiRequests g_autoVisionReq;

@@ -3,6 +3,8 @@
 #include <d3d11.h>
 #include <imgui.h>
 
+#include <cstddef>  // std::size_t (MSVC: d3d11/imgui não garantem este tipo)
+
 namespace st {
 
 struct Texture {

@@ -29,6 +29,7 @@ struct Rgba4 {
 }  // namespace st
 
 #include <array>
+#include <cstdint>  // std::uint8_t (MSVC: não garantido pelos headers acima)
 #include <optional>
 #include <string>
 #include <vector>
