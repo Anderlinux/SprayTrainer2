@@ -139,7 +139,7 @@ bool Apply(AppState& s, const ProfileData& d) {
     s.overlay.scale = d.overlayScale;
     s.overlay.opacity = d.overlayOpacity;
     s.overlay.refreshMs = d.overlayRefreshMs;
-    s.ui.accent = ImVec4(d.accent[0], d.accent[1], d.accent[2], 1.0f);
+    s.ui.accent = Rgba4{d.accent[0], d.accent[1], d.accent[2], 1.0f};
     s.ui.windowOpacity = d.windowOpacity;
     s.ui.scale = d.uiScale;
     s.visual.guide = static_cast<GuideMode>(std::clamp(d.visualGuide, 0, 2));
@@ -169,7 +169,7 @@ bool Apply(AppState& s, const ProfileData& d) {
     s.autoVision.confidenceMin = d.autoConfidenceMin;
     s.autoVision.intervalMs = d.autoIntervalMs;
     s.autoVision.confirmFrames = d.autoConfirmFrames;
-    theme::SetAccent(s.ui.accent);  // cada janela reaplica o estilo no próprio contexto
+    theme::SetAccent(ImVec4(s.ui.accent.x, s.ui.accent.y, s.ui.accent.z, 1.0f));  // cada janela reaplica o estilo no próprio contexto
     s.lastResult.reset();
     return true;
 }

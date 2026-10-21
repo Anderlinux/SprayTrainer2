@@ -46,6 +46,7 @@ private:
     void DrainMouse();
     void TickRepetition(double nowMs);
     void TickAutoVision(double nowMs);   // reconhecimento visual (captura->match->troca)
+    void HandleAutoVisionRequests();     // prévia/teste pedidos pela aba "Auto-Reconhecimento"
     void SyncRepetitionKeys();
     void CycleWeapon();                     // tecla de próxima arma (WM_HOTKEY ou polling)
     void CycleWeaponBack();                 // tecla de arma anterior (WM_HOTKEY ou polling)
@@ -100,6 +101,9 @@ private:
 
     AppState state_;
     MouseRing mouse_;
+
+    AutoVisionController autoVision_;   // reconhecimento visual (TickAutoVision)
+    bool lastAutoVisionEnabled_ = false;  // borda de ativação: religar limpa o estado anterior
 };
 
 }  // namespace st

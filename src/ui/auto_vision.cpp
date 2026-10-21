@@ -28,6 +28,19 @@ std::vector<std::string> AutoVisionController::ReloadTemplatesState(const AppSta
     return ReloadTemplates(AutoProfileView(state), state.weaponImages);
 }
 
+const WeaponImageEntry* AutoVisionController::WeaponImageEntryFor(const AppState& state, int weaponIndex) {
+    if (weaponIndex < 0 || weaponIndex >= static_cast<int>(Weapon::Count)) {
+        return nullptr;
+    }
+    const std::string_view id = GetWeaponInfo(static_cast<Weapon>(weaponIndex)).id;
+    for (const WeaponImageEntry& entry : state.weaponImages) {
+        if (entry.weaponId == id && !entry.pngBase64.empty()) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
 std::vector<std::string> AutoVisionController::ReloadTemplates(
     const ProfileData& profile, const std::vector<WeaponImageEntry>& entries) {
     std::vector<std::string> warnings;
@@ -183,6 +196,40 @@ void AutoVisionController::Reset() {
     picker_.Reset();
     status_ = FrameStatus{};
     lastCheckMs_ = -1.0e9;
+}
+
+bool AutoVisionController::ScoreTemplate(const ProfileData& profile, const std::string& pngBase64,
+                                         const ImageRgb& region, float& outConfidence) {
+    outConfidence = 0.0f;
+    if (profile.autoRegionW <= 0 || profile.autoRegionH <= 0 || region.Empty()) {
+        return false;
+    }
+    std::vector<unsigned char> pngBytes;
+    if (!Base64Decode(pngBase64, pngBytes)) {
+        return false;
+    }
+    ImageRgb decoded;
+    if (!DecodePng(pngBytes, decoded) || decoded.Empty()) {
+        return false;
+    }
+    if (decoded.width > profile.autoRegionW || decoded.height > profile.autoRegionH) {
+        return false;
+    }
+    TemplateMatcher matcher;
+    ImageRgb referenceSize;
+    referenceSize.width = region.width;   // escala da captura real, não da região configurada
+    referenceSize.height = region.height;
+    referenceSize.rgb.assign(region.SizeBytes(), 0u);
+    if (decoded.width > referenceSize.width || decoded.height > referenceSize.height) {
+        return false;  // template maior que a imagem realmente capturada
+    }
+    WeaponTemplate t;
+    t.weaponIndex = 0;  // índice irrelevante: só a batida importa aqui
+    t.image = std::move(decoded);
+    matcher.Build(referenceSize, {std::move(t)});
+    const TemplateMatcher::Hit hit = matcher.MatchBySlot(0, region);
+    outConfidence = TemplateMatcher::Confidence(hit.sad);
+    return true;
 }
 
 }  // namespace st

@@ -38,6 +38,13 @@ public:
     std::vector<std::string> ReloadTemplates(const ProfileData& profile,
                                              const std::vector<WeaponImageEntry>& entries);
 
+    // Comparação isolada de UM template contra uma imagem de região (botão
+    // "Testar agora" da aba): não toca no estado do AutoPicker nem troca arma.
+    // `pngBase64` é a imagem cadastrada; devolve false se nada pode ser
+    // comparado (sem região, PNG inválido ou template maior que a região).
+    static bool ScoreTemplate(const ProfileData& profile, const std::string& pngBase64,
+                              const ImageRgb& region, float& outConfidence);
+
     struct CaptureResult {
         bool ok = false;
         ImageRgb image;      // válido se ok
@@ -59,6 +66,12 @@ public:
 
     // Recarrega templates a partir do estado da UI (weaponImages + região).
     std::vector<std::string> ReloadTemplatesState(const AppState& state);
+
+    // Imagem cadastrada para uma arma (índice do enum Weapon) no estado da UI.
+    // Devolve nullptr se a arma não existe ou não tem imagem; caso contrário o
+    // ponteiro aponta para dentro de `state.weaponImages` (válido enquanto o
+    // vetor não for modificado — a UI usa imediatamente após chamar).
+    static const WeaponImageEntry* WeaponImageEntryFor(const AppState& state, int weaponIndex);
 
     const FrameStatus& Status() const { return status_; }
     // Última imagem capturada com sucesso (para prévia na UI). Vazia se nunca.

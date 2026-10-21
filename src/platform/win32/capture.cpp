@@ -136,4 +136,55 @@ AutoVisionController::CaptureResult CaptureScreenRegion(const ProfileData& profi
     return res;
 }
 
+AutoVisionController::CaptureResult CaptureAppStateRegion(const AppState& state) {
+    // Mesma moeda do restante do pipeline: ProfileData derivado do estado da UI.
+    ProfileData p;
+    p.autoVisionEnabled = state.autoVision.enabled;
+    p.autoRegionX = state.autoVision.regionX;
+    p.autoRegionY = state.autoVision.regionY;
+    p.autoRegionW = state.autoVision.regionW;
+    p.autoRegionH = state.autoVision.regionH;
+    p.autoWindowTitle = state.autoVision.windowTitle;
+    p.autoConfidenceMin = state.autoVision.confidenceMin;
+    p.autoIntervalMs = state.autoVision.intervalMs;
+    p.autoConfirmFrames = state.autoVision.confirmFrames;
+    return CaptureScreenRegion(p);
+}
+
+namespace {
+
+BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
+    auto* out = reinterpret_cast<std::vector<std::string>*>(lParam);
+    if (!IsWindowVisible(hwnd)) {
+        return TRUE;
+    }
+    const int len = GetWindowTextLengthW(hwnd);
+    if (len <= 0) {
+        return TRUE;
+    }
+    std::wstring title(static_cast<std::size_t>(len), L'\0');
+    if (GetWindowTextW(hwnd, title.data(), len + 1) <= 0) {
+        return TRUE;
+    }
+    const int need = WideCharToMultiByte(CP_UTF8, 0, title.data(), len, nullptr, 0, nullptr, nullptr);
+    if (need <= 0) {
+        return TRUE;
+    }
+    std::string utf8(static_cast<std::size_t>(need), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, title.data(), len, utf8.data(), need, nullptr, nullptr);
+    out->push_back(std::move(utf8));
+    return TRUE;
+}
+
+}  // namespace
+
+std::vector<std::string> ListTopLevelWindowTitles(std::size_t max) {
+    std::vector<std::string> titles;
+    EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&titles));
+    if (titles.size() > max) {
+        titles.resize(max);
+    }
+    return titles;
+}
+
 }  // namespace st

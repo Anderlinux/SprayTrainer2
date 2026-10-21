@@ -192,7 +192,7 @@ bool App::Init(HINSTANCE instance) {
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;  // layout é fixo; configurações vão para o perfil JSON (Etapa 5)
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    theme::SetAccent(state_.ui.accent);
+    theme::SetAccent(ImVec4(state_.ui.accent.x, state_.ui.accent.y, state_.ui.accent.z, 1.0f));
     theme::Apply();
     dpiScale_ = ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd_);
     ImGui_ImplWin32_Init(hwnd_);
@@ -257,6 +257,7 @@ int App::Run() {
         repeater_.SetUiFrameMs(loopFrameMs_);
         state_.nowMs = now;
         TickRepetition(now);
+        TickAutoVision(now);  // reconhecimento visual (no-op quando desligado)
         if (now - lastMouseCheckMs_ >= kMouseCheckIntervalMs) {
             state_.mouseDetected = AnyMousePresent();
             lastMouseCheckMs_ = now;
@@ -318,6 +319,9 @@ void App::RenderMain(double nowMs) {
     FixMousePosition();
     ImGui::NewFrame();
     state_.maximized = IsZoomed(hwnd_) != FALSE;
+    // Device exposto ao estado: a aba Auto-Reconhecimento cria texturas da
+    // prévia via LoadTextureFromMemory (WIC+DX11) durante o render.
+    state_.dx11Device = device_;
     RenderMainWindow(state_, nowMs);
     ImGui::Render();
     UpdateCursorClip();
@@ -526,6 +530,52 @@ void App::CycleWeaponBack() {
                      static_cast<int>(Weapon::Count);
     state_.weapon = static_cast<Weapon>(prev);
     state_.editorWeapon = state_.weapon;
+}
+
+// Troca direta de arma pelo índice (mesmo efeito dos seletores da UI e do F1/F2:
+// atualiza state_.weapon e o editor; a repetição é reconfigurada no próximo
+// TickRepetition/Start, exatamente como nas trocas manuais).
+void App::SelectWeapon(int weaponIndex) {
+    if (weaponIndex < 0 || weaponIndex >= static_cast<int>(Weapon::Count)) {
+        return;
+    }
+    state_.weapon = static_cast<Weapon>(weaponIndex);
+    state_.editorWeapon = state_.weapon;
+}
+
+void App::TickAutoVision(double nowMs) {
+    // Religou o modo automático? Recarrega templates e esquece o estado antigo.
+    if (state_.autoVision.enabled && !lastAutoVisionEnabled_) {
+        for (const std::string& warn : autoVision_.ReloadTemplatesState(state_)) {
+            state_.autoVisionLastReason = warn;  // primeiro aviso fica visível na UI
+        }
+    }
+    lastAutoVisionEnabled_ = state_.autoVision.enabled;
+
+    // A UI pediu recarga (imagens/região editadas): faz na thread da UI, aqui.
+    if (state_.autoVisionReloadRequest) {
+        state_.autoVisionReloadRequest = false;
+        autoVision_.ReloadTemplatesState(state_);
+    }
+
+    bool switched = false;
+    int weaponIndex = -1;
+    autoVision_.TickState(state_, nowMs, &CaptureAppStateRegion, switched, weaponIndex);
+
+    // Publica o status para a aba "Auto-Reconhecimento" ler durante o render.
+    const AutoVisionController::FrameStatus& fs = autoVision_.Status();
+    state_.autoVisionStatus = static_cast<int>(fs.status);
+    state_.autoVisionConfidence = fs.confidence;
+    state_.autoVisionRecognized = fs.weaponIndex;
+    state_.autoVisionLastSwitchMs = fs.lastSwitchMs;
+    state_.autoVisionCaptureFailed = fs.captureFailed;
+    if (!fs.reason.empty()) {
+        state_.autoVisionLastReason = fs.reason;
+    }
+
+    if (switched) {
+        SelectWeapon(weaponIndex);
+    }
 }
 
 void App::TickRepetition(double nowMs) {
