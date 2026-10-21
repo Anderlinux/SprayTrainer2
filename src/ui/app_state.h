@@ -6,6 +6,7 @@
 #include "core/pattern_store.h"
 #include "core/repetition.h"
 #include "core/training_session.h"
+#include "core/vision/weapon_images.h"
 #include "ui/textures.h"
 
 #include <array>
@@ -58,6 +59,21 @@ struct PatternRecorder {
     TrainingSession session;     // só mede o movimento e o tempo de cada tiro
     std::vector<Vec2> path;      // caminho gravado (modo Review)
     int smoothing = 1;           // 0 a 3
+};
+
+// Reconhecimento visual automático (mesmos campos da seção "autoVision" do perfil).
+// Ligado, o app escolhe a arma sozinho pela imagem na região monitorada — sem F1/F2.
+// Desligado (padrão), tudo continua exatamente como hoje.
+struct AutoVisionSettings {
+    bool enabled = false;
+    int regionX = 0;
+    int regionY = 0;
+    int regionW = 0;
+    int regionH = 0;
+    std::string windowTitle;      // vazio = região fixa em coordenadas de tela
+    float confidenceMin = 0.85f;  // 0..1
+    int intervalMs = 200;         // 100..2000
+    int confirmFrames = 3;        // 1..10
 };
 
 // Configuração da repetição automática (aba Ajustes > Repetição). Os VK são códigos
@@ -134,6 +150,10 @@ struct AppState {
 
     // Repetição automática do padrão (hotkey global; ver App::TickRepetition)
     RepetitionSettings repetition;
+    // Reconhecimento visual automático (aba Ajustes > Auto-Reconhecimento).
+    // As imagens de referência ficam em state_.weaponImages (seção "weaponImages").
+    AutoVisionSettings autoVision;
+    std::vector<WeaponImageEntry> weaponImages;
     bool repeatArmed = true;                 // false até a tecla de atalho ser solta
     int repeatHotkeyId = 0;                  // hotkey global registrada (0 = nenhuma)
     std::vector<int> registeredStopKeys{};   // VKs realmente registrados no Windows

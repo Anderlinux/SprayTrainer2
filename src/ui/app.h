@@ -1,5 +1,8 @@
 #pragma once
 
+#include "ui/auto_vision.h"
+#include "platform/win32/capture.h"
+
 #include "config/profile_store.h"
 #include "core/repetition.h"
 #include "input/raw_input.h"
@@ -42,9 +45,11 @@ private:
 
     void DrainMouse();
     void TickRepetition(double nowMs);
+    void TickAutoVision(double nowMs);   // reconhecimento visual (captura->match->troca)
     void SyncRepetitionKeys();
     void CycleWeapon();                     // tecla de próxima arma (WM_HOTKEY ou polling)
     void CycleWeaponBack();                 // tecla de arma anterior (WM_HOTKEY ou polling)
+    void SelectWeapon(int weaponIndex);     // troca direta (auto-reconhecimento; mesmo efeito do seletor da UI)
     bool IsRepeatButtonDown() const;   // botões do mouse como tecla de repetir
     void UnregisterAllHotkeys();
     static void SendMouseDelta(int dx, int dy);

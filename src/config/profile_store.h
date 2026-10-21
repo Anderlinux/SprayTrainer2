@@ -2,6 +2,7 @@
 
 #include "config/profile.h"
 #include "core/history.h"
+#include "core/vision/weapon_images.h"
 
 #include <filesystem>
 #include <optional>
@@ -37,6 +38,20 @@ public:
     StoreResult Delete(const std::string& name) const;
     StoreResult Rename(const std::string& from, const std::string& to) const;
     StoreResult Duplicate(const std::string& from, const std::string& to) const;
+
+    // Imagens de referência do reconhecimento automático (seção "weaponImages").
+    // Ficam num arquivo separado por perfil (<raiz>/profiles/<nome>.images.json),
+    // gravado atomicamente como o próprio perfil. Separado porque a camada de
+    // configuração não conhece visão; a UI chama estas funções junto com
+    // Save/Load/Duplicate/Rename/Delete. Perfil sem arquivo = lista vazia.
+    StoreResult SaveWeaponImages(const std::string& name, const std::vector<WeaponImageEntry>& entries) const;
+    StoreResult LoadWeaponImages(const std::string& name, std::vector<WeaponImageEntry>& out,
+                                 std::vector<std::string>* warnings = nullptr) const;
+
+private:
+    std::filesystem::path ImagesFileFor(const std::string& name) const;
+
+public:
 
     // Último perfil usado (settings.json). Vazio se não houver.
     std::string LastProfile() const;

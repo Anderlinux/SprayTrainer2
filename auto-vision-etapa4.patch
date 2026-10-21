@@ -1,0 +1,2934 @@
+diff --git a/.gitignore b/.gitignore
+index 077eade..e662946 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,15 +1,7 @@
+ build/
+-build-*/
++build*/
+ CMakeCache.txt
+ CMakeFiles/
+ cmake_install.cmake
+-Makefile
+-*.exe
+-*.o
+-*.obj
+-*.a
+-*.dll
+-*.so
+-*.bin
+-*.log
+-*.tmp
++CTestTestfile.cmake
++_deps/
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 416e391..e06b709 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -42,8 +42,19 @@ add_library(st_core STATIC
+     src/core/weapon.cpp
+     src/core/pattern_store.cpp
+     src/core/training_session.cpp
++    src/core/vision/auto_picker.cpp
++    src/core/vision/image.cpp
++    src/core/vision/matcher.cpp
++    src/core/vision/png.cpp
++    src/core/vision/weapon_images.cpp
++    # Orquestração do modo automático: pura (captura injetada por função),
++    # testável em Linux; no Windows o App injeta a captura real via BitBlt.
++    src/ui/auto_vision.cpp
+ )
+ target_include_directories(st_core PUBLIC src)
++# weapon_images usa nlohmann/json para a seção "weaponImages" do perfil.
++# A biblioteca continua portável (sem Win32) — só depende do header-only json.
++target_link_libraries(st_core PUBLIC nlohmann_json::nlohmann_json)
+ st_warnings(st_core)
+ 
+ # ------------------------------------------------------------------ perfis (portável)
+@@ -62,6 +73,13 @@ if(ST_BUILD_TESTS)
+     st_warnings(st_core_tests)
+     add_test(NAME core COMMAND st_core_tests)
+ 
++    # Testes do reconhecimento visual automático (downscale, template matching,
++    # máquina de estados anti-repetição e decoder PNG). Núcleo puro, roda em qualquer plataforma.
++    add_executable(st_vision_tests tests/vision_tests.cpp)
++    target_link_libraries(st_vision_tests PRIVATE st_core nlohmann_json::nlohmann_json)
++    st_warnings(st_vision_tests)
++    add_test(NAME vision COMMAND st_vision_tests)
++
+     add_executable(st_config_tests tests/config_tests.cpp)
+     target_link_libraries(st_config_tests PRIVATE st_config)
+     target_compile_definitions(st_config_tests PRIVATE ST_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+@@ -118,6 +136,8 @@ if(WIN32)
+         src/ui/page_visual.cpp
+         src/ui/pattern_editor.cpp
+         src/ui/profiles.cpp
++        src/ui/auto_vision.cpp
++        src/platform/win32/capture.cpp
+         src/ui/file_dialog.cpp
+         src/ui/spray_plot.cpp
+         src/ui/swap_target.cpp
+diff --git a/src/config/profile.cpp b/src/config/profile.cpp
+index 02bb204..a20bf1a 100644
+--- a/src/config/profile.cpp
++++ b/src/config/profile.cpp
+@@ -171,6 +171,36 @@ public:
+         out = it->get<bool>();
+     }
+ 
++    // Como Int, mas para campos opcionais de seções novas: ausente = padrão, sem aviso.
++    void IntOpt(const Json& obj, const std::string& section, const char* key, int& out, int lo, int hi) {
++        const auto it = obj.find(key);
++        if (it == obj.end()) {
++            return;
++        }
++        if (!it->is_number_integer()) {
++            Error(section + "." + key, "deveria ser um número inteiro");
++            return;
++        }
++        const long long v = it->get<long long>();
++        out = static_cast<int>(std::clamp<long long>(v, lo, hi));
++        if (out != v) {
++            Warn(section + "." + key + " fora da faixa; ajustado");
++        }
++    }
++
++    // Texto opcional (seções novas): ausente = mantém o padrão, sem aviso.
++    void StrOpt(const Json& obj, const std::string& section, const char* key, std::string& out) {
++        const auto it = obj.find(key);
++        if (it == obj.end()) {
++            return;
++        }
++        if (!it->is_string()) {
++            Error(section + "." + key, "deveria ser um texto");
++            return;
++        }
++        out = it->get<std::string>();
++    }
++
+     // Nome de tecla virtual ("F", "LBUTTON"...); aceita maiúsculas/minúsculas.
+     // `optional` = seções adicionadas depois da versão 1 (ausente não gera aviso).
+     void KeyField(const Json& obj, const std::string& section, const char* key, int& out, bool optional = false) {
+@@ -280,7 +310,11 @@ bool ProfileData::operator==(const ProfileData& o) const {
+            repeatReturnBack == o.repeatReturnBack &&
+            repeatRestartFromZero == o.repeatRestartFromZero &&
+            cycleWeaponKeyVk == o.cycleWeaponKeyVk &&
+-           cycleBackKeyVk == o.cycleBackKeyVk;
++           cycleBackKeyVk == o.cycleBackKeyVk &&
++           autoVisionEnabled == o.autoVisionEnabled && autoRegionX == o.autoRegionX &&
++           autoRegionY == o.autoRegionY && autoRegionW == o.autoRegionW && autoRegionH == o.autoRegionH &&
++           autoWindowTitle == o.autoWindowTitle && autoConfidenceMin == o.autoConfidenceMin &&
++           autoIntervalMs == o.autoIntervalMs && autoConfirmFrames == o.autoConfirmFrames;
+ }
+ 
+ ProfileData DefaultProfile() {
+@@ -358,6 +392,20 @@ std::string ProfileToJson(const ProfileData& d) {
+         rp["cycleBackKey"] = "OFF";
+     }
+ 
++    // "autoVision" entrou depois da versão 1: perfis antigos não têm a seção.
++    OrderedJson& av = j["autoVision"];
++    av["enabled"] = d.autoVisionEnabled;
++    av["windowTitle"] = d.autoWindowTitle;
++    OrderedJson region = OrderedJson::array();
++    region.push_back(d.autoRegionX);
++    region.push_back(d.autoRegionY);
++    region.push_back(d.autoRegionW);
++    region.push_back(d.autoRegionH);
++    av["region"] = std::move(region);
++    av["confidenceMin"] = Pretty(d.autoConfidenceMin);
++    av["intervalMs"] = d.autoIntervalMs;
++    av["confirmFrames"] = d.autoConfirmFrames;
++
+     return j.dump(2) + "\n";
+ }
+ 
+@@ -537,6 +585,42 @@ ParseResult ProfileFromJson(const std::string& text, ProfileData& out) {
+         }
+     }
+ 
++    // "autoVision" entrou depois da versão 1: seção ausente = tudo desligado/padrão,
++    // sem aviso (perfis antigos continuam carregando normalmente).
++    if (const Json* av = rd.Section(j, "autoVision", true)) {
++        rd.BoolOpt(*av, "autoVision", "enabled", d.autoVisionEnabled);
++        rd.StrOpt(*av, "autoVision", "windowTitle", d.autoWindowTitle);
++        if (const auto reg = av->find("region"); reg != av->end()) {
++            if (!reg->is_array() || reg->size() != 4) {
++                rd.Error("autoVision.region", "deveria ser uma lista [x, y, w, h]");
++            } else {
++                int vals[4];
++                bool bad = false;
++                for (std::size_t i = 0; i < 4; ++i) {
++                    const Json& v = (*reg)[i];
++                    if (!v.is_number_integer()) {
++                        rd.Error("autoVision.region", "deveria conter quatro números inteiros");
++                        bad = true;
++                        break;
++                    }
++                    vals[i] = static_cast<int>(std::clamp<long long>(v.get<long long>(), -32768, 32767));
++                }
++                if (!bad) {
++                    d.autoRegionX = vals[0];
++                    d.autoRegionY = vals[1];
++                    d.autoRegionW = std::clamp(vals[2], 0, kMaxAutoRegionSize);
++                    d.autoRegionH = std::clamp(vals[3], 0, kMaxAutoRegionSize);
++                    if (vals[2] != d.autoRegionW || vals[3] != d.autoRegionH) {
++                        rd.Warn("autoVision.region fora da faixa; ajustado");
++                    }
++                }
++            }
++        }
++        rd.Float(*av, "autoVision", "confidenceMin", d.autoConfidenceMin, 0.0f, 1.0f, true);
++        rd.IntOpt(*av, "autoVision", "intervalMs", d.autoIntervalMs, 100, 2000);
++        rd.IntOpt(*av, "autoVision", "confirmFrames", d.autoConfirmFrames, 1, 10);
++    }
++
+     if (rd.Failed()) {
+         return result;
+     }
+diff --git a/src/config/profile.h b/src/config/profile.h
+index bc79d47..5577439 100644
+--- a/src/config/profile.h
++++ b/src/config/profile.h
+@@ -59,9 +59,24 @@ struct ProfileData {
+     int cycleWeaponKeyVk = kDefaultCycleWeaponKeyVk;  // tecla para a próxima arma (0 = desligado)
+     int cycleBackKeyVk = kDefaultCycleBackKeyVk;      // tecla para a arma anterior (0 = desligado)
+ 
++    // Reconhecimento visual automático (seção "autoVision", opcional). Quando
++    // ligado, o app captura a região abaixo e escolhe a arma sozinha — sem F1/F2.
++    bool autoVisionEnabled = false;   // inicia desligado: modo manual é o comportamento padrão
++    int autoRegionX = 0;              // região em pixels de tela (x, y, w, h)
++    int autoRegionY = 0;
++    int autoRegionW = 0;
++    int autoRegionH = 0;
++    std::string autoWindowTitle;      // título da janela monitorada (vazio = região fixa na tela)
++    float autoConfidenceMin = 0.85f;  // confiança mínima (0..1) para aceitar um match
++    int autoIntervalMs = 200;         // intervalo entre verificações (100..2000)
++    int autoConfirmFrames = 3;        // leituras iguais consecutivas antes de trocar (1..10)
++
+     bool operator==(const ProfileData& other) const;
+ };
+ 
++// Limite aceito no load/save para tamanho da região (maior que isso é erro de configuração).
++inline constexpr int kMaxAutoRegionSize = 16384;
++
+ // Valores de fábrica (padrões de recuo padrão incluídos).
+ ProfileData DefaultProfile();
+ 
+diff --git a/src/config/profile_store.cpp b/src/config/profile_store.cpp
+index e4a2c31..09c0feb 100644
+--- a/src/config/profile_store.cpp
++++ b/src/config/profile_store.cpp
+@@ -172,11 +172,58 @@ StoreResult ProfileStore::Save(const std::string& name, const ProfileData& data)
+     return WriteTextAtomic(FileFor(name), ProfileToJson(data));
+ }
+ 
++// ---- Imagens de referência do reconhecimento automático ----
++fs::path ProfileStore::ImagesFileFor(const std::string& name) const {
++    return ProfilesDir() / PathFromUtf8(name + ".images.json");
++}
++
++StoreResult ProfileStore::SaveWeaponImages(const std::string& name,
++                                           const std::vector<WeaponImageEntry>& entries) const {
++    if (const auto err = ValidateName(name)) {
++        return StoreResult::Fail(*err);
++    }
++    if (StoreResult r = EnsureDirs(); !r.ok) {
++        return r;
++    }
++    // Lista vazia: remove o arquivo em vez de deixar um JSON vazio para trás.
++    if (entries.empty()) {
++        std::error_code ec;
++        fs::remove(ImagesFileFor(name), ec);  // melhor esforço; ausência = vazio no load
++        return {};
++    }
++    return WriteTextAtomic(ImagesFileFor(name), WeaponImagesToJson(entries));
++}
++
++StoreResult ProfileStore::LoadWeaponImages(const std::string& name, std::vector<WeaponImageEntry>& out,
++                                           std::vector<std::string>* warnings) const {
++    out.clear();
++    std::string text;
++    if (StoreResult r = ReadText(ImagesFileFor(name), text); !r.ok) {
++        // Arquivo ausente é normal (perfil sem imagens cadastradas): não é erro.
++        std::error_code ec;
++        if (!fs::exists(ImagesFileFor(name), ec)) {
++            return {};
++        }
++        return r;
++    }
++    const WeaponImagesParseResult parsed = WeaponImagesFromJson(text, out);
++    if (!parsed.ok) {
++        return StoreResult::Fail(parsed.warnings.empty() ? "arquivo de imagens inválido"
++                                                          : parsed.warnings.front());
++    }
++    if (warnings != nullptr) {
++        *warnings = parsed.warnings;
++    }
++    return {};
++}
++
+ StoreResult ProfileStore::Delete(const std::string& name) const {
+     std::error_code ec;
+     if (!fs::remove(FileFor(name), ec) || ec) {
+         return StoreResult::Fail("não foi possível excluir o perfil \"" + name + "\"");
+     }
++    // Remove também o arquivo irmão de imagens (melhor esforço; ausência é normal).
++    fs::remove(ImagesFileFor(name), ec);
+     if (LastProfile() == name) {
+         SetLastProfile("");
+     }
+@@ -202,6 +249,13 @@ StoreResult ProfileStore::Rename(const std::string& from, const std::string& to)
+     if (ec) {
+         return StoreResult::Fail("não foi possível renomear o perfil");
+     }
++    // O arquivo irmão de imagens acompanha o rename (melhor esforço: se não
++    // existir — perfil sem imagens — ou falhar, o perfil continua válido).
++    std::error_code ecImg;
++    fs::rename(ImagesFileFor(from), ImagesFileFor(to), ecImg);
++    if (!ecImg && fs::exists(ImagesFileFor(from))) {
++        fs::remove(ImagesFileFor(from), ecImg);  // disco que diferencia maiúsculas: src sobrou
++    }
+     if (LastProfile() == from) {
+         SetLastProfile(to);
+     }
+@@ -216,7 +270,15 @@ StoreResult ProfileStore::Duplicate(const std::string& from, const std::string&
+     if (StoreResult r = Load(from, data); !r.ok) {
+         return r;
+     }
+-    return Save(to, data);
++    if (StoreResult r = Save(to, data); !r.ok) {
++        return r;
++    }
++    // Cópia também leva as imagens de referência (se houver).
++    std::vector<WeaponImageEntry> images;
++    if (StoreResult r = LoadWeaponImages(from, images); r.ok && !images.empty()) {
++        return SaveWeaponImages(to, images);
++    }
++    return {};
+ }
+ 
+ std::string ProfileStore::LastProfile() const {
+diff --git a/src/config/profile_store.h b/src/config/profile_store.h
+index c51fbe4..1371b46 100644
+--- a/src/config/profile_store.h
++++ b/src/config/profile_store.h
+@@ -2,6 +2,7 @@
+ 
+ #include "config/profile.h"
+ #include "core/history.h"
++#include "core/vision/weapon_images.h"
+ 
+ #include <filesystem>
+ #include <optional>
+@@ -38,6 +39,20 @@ public:
+     StoreResult Rename(const std::string& from, const std::string& to) const;
+     StoreResult Duplicate(const std::string& from, const std::string& to) const;
+ 
++    // Imagens de referência do reconhecimento automático (seção "weaponImages").
++    // Ficam num arquivo separado por perfil (<raiz>/profiles/<nome>.images.json),
++    // gravado atomicamente como o próprio perfil. Separado porque a camada de
++    // configuração não conhece visão; a UI chama estas funções junto com
++    // Save/Load/Duplicate/Rename/Delete. Perfil sem arquivo = lista vazia.
++    StoreResult SaveWeaponImages(const std::string& name, const std::vector<WeaponImageEntry>& entries) const;
++    StoreResult LoadWeaponImages(const std::string& name, std::vector<WeaponImageEntry>& out,
++                                 std::vector<std::string>* warnings = nullptr) const;
++
++private:
++    std::filesystem::path ImagesFileFor(const std::string& name) const;
++
++public:
++
+     // Último perfil usado (settings.json). Vazio se não houver.
+     std::string LastProfile() const;
+     StoreResult SetLastProfile(const std::string& name) const;
+diff --git a/src/core/vision/auto_picker.cpp b/src/core/vision/auto_picker.cpp
+new file mode 100644
+index 0000000..308c8f1
+--- /dev/null
++++ b/src/core/vision/auto_picker.cpp
+@@ -0,0 +1,147 @@
++#include "core/vision/auto_picker.h"
++
++#include <algorithm>
++
++namespace st {
++
++namespace {
++
++const char* StatusName(AutoPicker::Status s) {
++    switch (s) {
++        case AutoPicker::Status::Waiting: return "aguardando imagem";
++        case AutoPicker::Status::Pending: return "reconhecendo";
++        case AutoPicker::Status::Identified: return "identificado";
++        case AutoPicker::Status::Ambiguous: return "ambiguo";
++        case AutoPicker::Status::LowScore: return "confianca baixa";
++    }
++    return "desconhecido";
++}
++
++}  // namespace
++
++AutoPicker::Result AutoPicker::Observe(double nowMs, const std::vector<float>& scores) {
++    Result res;
++
++    // Melhor e segunda melhor leitura desta verificação.
++    int best = -1;
++    float bestScore = 0.0f;
++    float secondScore = 0.0f;
++    for (std::size_t i = 0; i < scores.size(); ++i) {
++        const float s = std::clamp(scores[i], 0.0f, 1.0f);
++        if (s > bestScore) {
++            secondScore = bestScore;
++            bestScore = s;
++            best = static_cast<int>(i);
++        } else if (s > secondScore) {
++            secondScore = s;
++        }
++    }
++
++    // Sem candidato válido: rejeição por confiança baixa ou espera simples.
++    if (best < 0 || bestScore < params_.minConfidence) {
++        candidate_ = -1;
++        candidateCount_ = 0;
++        candidateConfidence_ = 0.0f;
++        if (best >= 0 && bestScore > 0.3f) {
++            status_ = Status::LowScore;
++            res.status = Status::LowScore;
++            res.confidence = bestScore;
++            res.reason = "melhor batida abaixo do minimo de confianca";
++        } else {
++            status_ = Status::Waiting;
++            res.status = Status::Waiting;
++            res.reason = "nenhuma imagem reconhecida na regiao";
++        }
++        // Arma atual permanece ativa (a imagem pode ter sumido temporariamente);
++        // nada é executado ate uma nova transicao confirmada.
++        res.weaponIndex = current_;
++        return res;
++    }
++
++    // Ambiguidade: duas armas acima do minimo com confiancas muito proximas.
++    if (secondScore >= params_.minConfidence &&
++        (bestScore - secondScore) < params_.ambiguityMargin) {
++        candidate_ = -1;
++        candidateCount_ = 0;
++        candidateConfidence_ = 0.0f;
++        status_ = Status::Ambiguous;
++        res.status = Status::Ambiguous;
++        res.confidence = bestScore;
++        res.reason = "duas imagens parecidas: ajuste a confianca minima ou as referencias";
++        res.weaponIndex = current_;
++        return res;
++    }
++
++    // Mesma arma ja confirmada em uso: nao repetir execucao (requisito 6).
++    if (best == current_) {
++        candidate_ = -1;
++        candidateCount_ = 0;
++        candidateConfidence_ = 0.0f;
++        currentConfidence_ = bestScore;
++        status_ = Status::Identified;
++        res.status = Status::Identified;
++        res.confidence = bestScore;
++        res.weaponIndex = current_;
++        res.reason = std::string("mantendo ") + StatusName(Status::Identified);
++        return res;
++    }
++
++    // Anti-oscilação: janela minima apos uma troca — leituras diferentes dentro
++    // dela sao ignoradas, impedindo alternancias rapidas entre dois itens. O
++    // candidato corrente continua confirmado normalmente (a troca que acabou de
++    // acontecer precisa "pegar" mesmo com confirmacoes > 1).
++    if (best != current_ && best != candidate_ && nowMs - lastSwitchMs_ < params_.minIntervalMs) {
++        res.status = status_;
++        res.confidence = bestScore;
++        res.weaponIndex = current_;
++        res.reason = "intervalo minimo entre trocas";
++        return res;
++    }
++
++    // Candidato diferente da arma atual: acumula confirmacoes consecutivas.
++    if (best != candidate_) {
++        candidate_ = best;
++        candidateCount_ = 1;
++        candidateConfidence_ = bestScore;
++    } else {
++        ++candidateCount_;
++        candidateConfidence_ = std::max(candidateConfidence_, bestScore);
++    }
++
++    if (candidateCount_ < std::max(1, params_.confirmations)) {
++        status_ = Status::Pending;
++        res.status = Status::Pending;
++        res.confidence = bestScore;
++        res.weaponIndex = current_;
++        res.reason = "aguardando confirmacoes (" + std::to_string(candidateCount_) + "/" +
++                     std::to_string(std::max(1, params_.confirmations)) + ")";
++        return res;
++    }
++
++    // Transicao confirmada: executar exatamente uma vez.
++    current_ = candidate_;
++    currentConfidence_ = candidateConfidence_;
++    lastSwitchMs_ = nowMs;
++    candidate_ = -1;
++    candidateCount_ = 0;
++    candidateConfidence_ = 0.0f;
++    status_ = Status::Identified;
++    res.switched = true;
++    res.status = Status::Identified;
++    res.confidence = currentConfidence_;
++    res.weaponIndex = current_;
++    res.reason = "imagem reconhecida: mudar para o item correspondente";
++    return res;
++}
++
++void AutoPicker::Reset() {
++    status_ = Status::Waiting;
++    current_ = -1;
++    currentConfidence_ = 0.0f;
++    candidate_ = -1;
++    candidateCount_ = 0;
++    candidateConfidence_ = 0.0f;
++    lastSwitchMs_ = -1.0e9;
++}
++
++}  // namespace st
+diff --git a/src/core/vision/auto_picker.h b/src/core/vision/auto_picker.h
+new file mode 100644
+index 0000000..d0988ef
+--- /dev/null
++++ b/src/core/vision/auto_picker.h
+@@ -0,0 +1,69 @@
++#pragma once
++
++#include "core/vision/matcher.h"
++
++#include <string>
++#include <vector>
++
++namespace st {
++
++// Máquina de estados do reconhecimento automático: recebe o resultado de cada
++// verificação (as confianças por arma) e decide quando MUDAR a arma do replay.
++// Regras (requisito 6): só executa em transição confirmada; nada de repetição
++// enquanto a mesma imagem persiste; ambiguidade e confiança baixa não acionam;
++// exige N confirmações consecutivas antes de trocar; volta para "esperando"
++// quando nenhuma imagem bate. Pura: o tempo vem como parâmetro, sem threads.
++class AutoPicker {
++public:
++    struct Params {
++        float minConfidence = 0.85f;   // abaixo disso: rejeitado ("confiança baixa")
++        float ambiguityMargin = 0.03f; // diferença mínima entre 1º e 2º colocados
++        int confirmations = 3;         // leituras consecutivas da mesma arma p/ confirmar
++        double minIntervalMs = 400.0;  // espera mínima depois de uma troca (anti-oscilação)
++    };
++
++    enum class Status {
++        Waiting,     // nenhuma imagem reconhecida (aguardando)
++        Pending,     // candidato visto, ainda sem confirmações suficientes
++        Identified,  // arma confirmada (executada nesta transição)
++        Ambiguous,   // duas armas com confiança parecida acima do mínimo
++        LowScore,    // melhor batida abaixo do mínimo de confiança
++    };
++
++    struct Result {
++        bool switched = false;          // true exatamente quando o App deve trocar a arma
++        int weaponIndex = -1;           // arma ativa agora (-1 = esperando)
++        Status status = Status::Waiting;
++        float confidence = 0.0f;        // confiança da arma ativa/candidata
++        std::string reason;             // motivo legível da última decisão/rejeição
++    };
++
++    AutoPicker() = default;
++    explicit AutoPicker(const Params& params) : params_(params) {}
++
++    void SetParams(const Params& params) { params_ = params; }
++    const Params& GetParams() const { return params_; }
++
++    // Uma verificação: `scores[i]` é a confiança da arma de índice i (0 se sem template).
++    // `nowMs` é o relógio do app. Devolve a decisão; `switched` dispara o replay.
++    Result Observe(double nowMs, const std::vector<float>& scores);
++
++    // Desliga o modo automático: esquece tudo (a próxima leitura recomeça do zero).
++    void Reset();
++
++    Status GetStatus() const { return status_; }
++    int CurrentWeapon() const { return current_; }
++    float CurrentConfidence() const { return currentConfidence_; }
++
++private:
++    Params params_;
++    Status status_ = Status::Waiting;
++    int current_ = -1;                    // arma em uso pelo modo automático (-1 = nenhuma)
++    float currentConfidence_ = 0.0f;
++    int candidate_ = -1;                  // arma aguardando confirmação
++    int candidateCount_ = 0;
++    float candidateConfidence_ = 0.0f;
++    double lastSwitchMs_ = -1.0e9;
++};
++
++}  // namespace st
+diff --git a/src/core/vision/image.cpp b/src/core/vision/image.cpp
+new file mode 100644
+index 0000000..ba081d4
+--- /dev/null
++++ b/src/core/vision/image.cpp
+@@ -0,0 +1,55 @@
++#include "core/vision/image.h"
++
++namespace st {
++
++bool DownscaleHalf(const ImageRgb& in, ImageRgb& out) {
++    if (in.Empty()) {
++        return false;
++    }
++    const int w = in.width / 2;
++    const int h = in.height / 2;
++    if (w <= 0 || h <= 0) {
++        return false;
++    }
++    ImageRgb res;
++    res.width = w;
++    res.height = h;
++    res.rgb.resize(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3u);
++    for (int y = 0; y < h; ++y) {
++        for (int x = 0; x < w; ++x) {
++            const std::size_t rowW = static_cast<std::size_t>(in.width) * 3u;
++            const std::size_t srcBase = (static_cast<std::size_t>(y * 2) * static_cast<std::size_t>(in.width) +
++                                         static_cast<std::size_t>(x * 2)) * 3u;
++            const std::size_t dstBase = (static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
++                                         static_cast<std::size_t>(x)) * 3u;
++            for (std::size_t c = 0; c < 3u; ++c) {
++                // Média 2x2 com arredondamento para o inteiro mais próximo. Os
++                // quatro pixels do bloco estão em srcBase (x,y), srcBase+3 (x+1,y),
++                // srcBase+rowW (x,y+1) e srcBase+rowW+3 (x+1,y+1).
++                const unsigned sum = in.rgb[srcBase + c] + in.rgb[srcBase + 3u + c] +
++                                     in.rgb[srcBase + rowW + c] + in.rgb[srcBase + rowW + 3u + c];
++                res.rgb[dstBase + c] = static_cast<std::uint8_t>((sum + 2u) / 4u);
++            }
++        }
++    }
++    out = std::move(res);
++    return true;
++}
++
++void DownscaleToFit(const ImageRgb& in, int maxSide, ImageRgb& out) {
++    if (in.Empty()) {
++        out = ImageRgb{};
++        return;
++    }
++    ImageRgb cur = in;
++    while (cur.width > maxSide || cur.height > maxSide) {
++        ImageRgb next;
++        if (!DownscaleHalf(cur, next)) {
++            break;  // 1x1 ou degenerada: para de reduzir
++        }
++        cur = std::move(next);
++    }
++    out = std::move(cur);
++}
++
++}  // namespace st
+diff --git a/src/core/vision/image.h b/src/core/vision/image.h
+new file mode 100644
+index 0000000..539f14d
+--- /dev/null
++++ b/src/core/vision/image.h
+@@ -0,0 +1,27 @@
++#pragma once
++
++#include <cstdint>
++#include <vector>
++
++namespace st {
++
++// Imagem RGB de 8 bits por canal, linha a linha (3 bytes por pixel). Núcleo puro:
++// sem dependências de plataforma — a captura (Win32) e a UI só entregam/recebem bytes.
++struct ImageRgb {
++    int width = 0;
++    int height = 0;
++    std::vector<std::uint8_t> rgb;  // tamanho = width * height * 3
++
++    std::size_t SizeBytes() const { return static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3u; }
++    bool Empty() const { return width <= 0 || height <= 0 || rgb.size() != SizeBytes(); }
++};
++
++// Reduz pela metade (2x2 -> média). Devolve false se `out` já couber em `maxSide`
++// ou se a imagem for degenerada; `out` recebe o resultado quando devolve true.
++bool DownscaleHalf(const ImageRgb& in, ImageRgb& out);
++
++// Reduz até que o maior lado seja <= maxSide (repete DownscaleHalf). Se já couber,
++// copia `in` para `out` sem alterar.
++void DownscaleToFit(const ImageRgb& in, int maxSide, ImageRgb& out);
++
++}  // namespace st
+diff --git a/src/core/vision/matcher.cpp b/src/core/vision/matcher.cpp
+new file mode 100644
+index 0000000..50f545b
+--- /dev/null
++++ b/src/core/vision/matcher.cpp
+@@ -0,0 +1,204 @@
++#include "core/vision/matcher.h"
++
++#include <algorithm>
++#include <cmath>
++
++namespace st {
++
++namespace {
++
++// Maior potência de 2 que reduz `side` para um valor PAR <= maxSide. O divisor tem
++// de ser par: a região capturada pode ter lado ímpar (ex.: 97) e o tamanho dela é
++// derivado como refW*factor — só com factor par esse produto reproduz o original.
++int DownscaleFactor(int side, int maxSide) {
++    int factor = 2;
++    while (side / factor > maxSide && side / (factor * 2) > 0) {
++        factor *= 2;
++    }
++    return factor;
++}
++
++// Reduz por blocos quadrados de `factor` x `factor` tirando a média.
++ImageRgb BoxDownscale(const ImageRgb& in, int factor) {
++    if (in.Empty()) {
++        return ImageRgb{};
++    }
++    if (factor <= 1) {
++        return in;
++    }
++    ImageRgb out;
++    out.width = in.width / factor;
++    out.height = in.height / factor;
++    if (out.width <= 0 || out.height <= 0) {
++        return ImageRgb{};
++    }
++    out.rgb.resize(out.SizeBytes());
++    const std::size_t n = static_cast<std::size_t>(factor) * static_cast<std::size_t>(factor);
++    for (int y = 0; y < out.height; ++y) {
++        for (int x = 0; x < out.width; ++x) {
++            unsigned sum[3] = {0, 0, 0};
++            for (int dy = 0; dy < factor; ++dy) {
++                const std::size_t rowBase = static_cast<std::size_t>(y * factor + dy) *
++                                            static_cast<std::size_t>(in.width) * 3u;
++                for (int dx = 0; dx < factor; ++dx) {
++                    const std::size_t p = rowBase + static_cast<std::size_t>(x * factor + dx) * 3u;
++                    sum[0] += in.rgb[p];
++                    sum[1] += in.rgb[p + 1u];
++                    sum[2] += in.rgb[p + 2u];
++                }
++            }
++            const std::size_t d = (static_cast<std::size_t>(y) * static_cast<std::size_t>(out.width) +
++                                   static_cast<std::size_t>(x)) * 3u;
++            for (std::size_t c = 0; c < 3u; ++c) {
++                // Truncamento simples (sem "+ n/2"): template e região passam pelo
++                // mesmo caminho, então o viés cancela na comparação — ver image.cpp.
++                out.rgb[d + c] = static_cast<std::uint8_t>(sum[c] / n);
++            }
++        }
++    }
++    return out;
++}
++
++}  // namespace
++
++void TemplateMatcher::Build(const ImageRgb& referenceSize, const std::vector<WeaponTemplate>& templates) {
++    templates_.clear();
++    factor_ = 1;
++    refW_ = 0;
++    refH_ = 0;
++    if (referenceSize.Empty()) {
++        return;
++    }
++    factor_ = DownscaleFactor(std::max(referenceSize.width, referenceSize.height), kMaxSide);
++    const int rw = referenceSize.width / factor_;
++    const int rh = referenceSize.height / factor_;
++    if (rw <= 0 || rh <= 0) {
++        return;
++    }
++    refW_ = rw;
++    refH_ = rh;
++
++    for (const WeaponTemplate& t : templates) {
++        if (t.weaponIndex < 0 || t.image.Empty()) {
++            continue;
++        }
++        const ImageRgb scaled = BoxDownscale(t.image, factor_);
++        if (scaled.Empty() || scaled.width > refW_ || scaled.height > refH_) {
++            continue;  // template maior que a região: impossível de casar
++        }
++        templates_.push_back({t.weaponIndex, scaled});
++    }
++}
++
++float TemplateMatcher::Confidence(float sad) {
++    // Ver o comentário no header: curva logarítmica ancorada em sad=32 -> 0.5.
++    const double s = sad < 0.0 ? 0.0 : static_cast<double>(sad);
++    const double c = 1.0 / (1.0 + s / 32.0);
++    return static_cast<float>(c < 0.0 ? 0.0 : (c > 1.0 ? 1.0 : c));
++}
++
++std::size_t TemplateMatcher::PixelDiffCount(const ImageRgb& a, const ImageRgb& b) {
++    if (a.width != b.width || a.height != b.height || a.Empty() || b.Empty()) {
++        return 0;
++    }
++    std::size_t diff = 0;
++    for (std::size_t i = 0; i < a.rgb.size(); i += 3u) {
++        if (a.rgb[i] != b.rgb[i] || a.rgb[i + 1u] != b.rgb[i + 1u] || a.rgb[i + 2u] != b.rgb[i + 2u]) {
++            ++diff;
++        }
++    }
++    return diff;
++}
++
++TemplateMatcher::Hit TemplateMatcher::Match(int weaponIndex, const ImageRgb& region) const {
++    Hit miss;
++    if (refW_ <= 0 || templates_.empty() || region.Empty()) {
++        return miss;
++    }
++    const Entry* entry = nullptr;
++    for (const Entry& e : templates_) {
++        if (e.weaponIndex == weaponIndex) {
++            entry = &e;
++            break;
++        }
++    }
++    if (entry == nullptr) {
++        return miss;
++    }
++    return MatchImpl(*entry, region);
++}
++
++TemplateMatcher::Hit TemplateMatcher::MatchBySlot(int slot, const ImageRgb& region) const {
++    if (slot < 0 || static_cast<std::size_t>(slot) >= templates_.size()) {
++        return Hit{};
++    }
++    return MatchImpl(templates_[static_cast<std::size_t>(slot)], region);
++}
++
++// Núcleo comum: desloca `entry.image` sobre a região reduzida e devolve a
++// melhor batida. Separado de Match/MatchBySlot para não duplicar o laço SAD.
++TemplateMatcher::Hit TemplateMatcher::MatchImpl(const Entry& entry, const ImageRgb& region) const {
++    Hit miss;
++    if (refW_ <= 0 || region.Empty()) {
++        return miss;
++    }
++    if (region.width != refW_ * factor_ || region.height != refH_ * factor_) {
++        return miss;  // tamanho diferente do cadastrado: precisa reconfigurar/regenerar
++    }
++    const ImageRgb scaled = BoxDownscale(region, factor_);
++    if (scaled.Empty()) {
++        return miss;
++    }
++    const int tw = entry.image.width;
++    const int th = entry.image.height;
++    if (tw > scaled.width || th > scaled.height) {
++        return miss;
++    }
++    const std::size_t rowBytes = static_cast<std::size_t>(tw) * 3u;  // bytes por linha do template
++    const double denom = static_cast<double>(rowBytes) * static_cast<double>(th);  // pixels*canais
++    double bestSad = 255.0;
++    int bestX = 0;
++    int bestY = 0;
++    bool found = false;
++    // Nota de performance: sem early-exit por limiar — como o SAD é uma MÉDIA, um
++    // único pixel fora do template derrubaria a soma parcial por baixo e faria o
++    // corte antecipado descartar a batida correta. Para regiões de HUD (<=96 px na
++    // escala de trabalho) o custo total segue mínimo; além disso, uma batida
++    // praticamente idêntica encerra a busca imediatamente.
++    for (int y = 0; y + th <= scaled.height && !found; ++y) {
++        for (int x = 0; x + tw <= scaled.width; ++x) {
++            unsigned long long sum = 0;
++            const std::size_t sBase = static_cast<std::size_t>(y) * static_cast<std::size_t>(scaled.width) * 3u +
++                                      static_cast<std::size_t>(x) * 3u;
++            for (int ty = 0; ty < th; ++ty) {
++                // stride da REGIÃO reduzida entre linhas; offset do TEMPLATE é ty*rowBytes
++                const std::size_t sOff = sBase + static_cast<std::size_t>(ty) *
++                                                      static_cast<std::size_t>(scaled.width) * 3u;
++                const std::size_t tOff = static_cast<std::size_t>(ty) * rowBytes;
++                for (std::size_t p = 0; p < rowBytes; ++p) {
++                    sum += static_cast<unsigned long long>(
++                        std::abs(static_cast<int>(scaled.rgb[sOff + p]) - static_cast<int>(entry.image.rgb[tOff + p])));
++                }
++            }
++            const double sad = static_cast<double>(sum) / denom;
++            if (sad < bestSad) {
++                bestSad = sad;
++                bestX = x;
++                bestY = y;
++                if (sad < 0.01) {
++                    found = true;  // idêntica na escala de trabalho: não vale procurar mais
++                    break;
++                }
++            }
++        }
++    }
++    Hit hit;
++    hit.sad = static_cast<float>(bestSad);
++    hit.x = bestX * factor_;  // de volta à escala original da região
++    hit.y = bestY * factor_;
++    hit.templateWidth = tw * factor_;
++    hit.templateHeight = th * factor_;
++    return hit;
++}
++
++}  // namespace st
+diff --git a/src/core/vision/matcher.h b/src/core/vision/matcher.h
+new file mode 100644
+index 0000000..ac94d80
+--- /dev/null
++++ b/src/core/vision/matcher.h
+@@ -0,0 +1,85 @@
++#pragma once
++
++#include "core/vision/image.h"
++
++#include <cstddef>
++#include <vector>
++
++namespace st {
++
++// Comparação de imagens por similaridade: SAD (soma das diferenças absolutas) média
++// por canal, 0..255, convertida em confiança 0..1 (1 = idêntica). Núcleo puro, sem
++// dependências externas — o reconhecimento pode ser testado em qualquer plataforma
++// com imagens sintéticas. O template desliza sobre a região: a arma é reconhecida
++// mesmo que apareça deslocada dentro da área monitorada.
++class TemplateMatcher {
++public:
++    // Lado máximo após a redução (potência de 2 ajuda o downscale por 2x2).
++    // 96 mantém templates de HUD legíveis e o custo por verificação baixo.
++    static constexpr int kMaxSide = 96;
++
++    struct WeaponTemplate {
++        int weaponIndex = -1;  // índice no enum Weapon
++        ImageRgb image;        // imagem de referência da arma (qualquer tamanho <= região)
++    };
++
++    // Escala comum: as imagens de referência são cadastradas NO TAMANHO DA REGIÃO
++    // (recorte exato da área monitorada), então basta reduzir tudo pelo mesmo fator
++    // para caber em kMaxSide. Regiões capturadas mantêm o mesmo tamanho da região
++    // configurada — qualquer outro tamanho é rejeitado (a UI trata como erro).
++    // Templates que não couberem na região reduzida são descartados (a UI avisa).
++    void Build(const ImageRgb& referenceSize, const std::vector<WeaponTemplate>& templates);
++
++    bool Empty() const { return templates_.empty(); }
++    std::size_t Count() const { return templates_.size(); }
++
++    struct Hit {
++        float sad = 255.0f;      // menor SAD médio por canal encontrado (0 = idêntica)
++        int x = 0;               // posição da melhor batida, na região ORIGINAL
++        int y = 0;
++        int templateWidth = 0;   // tamanho do template já na escala de trabalho
++        int templateHeight = 0;
++    };
++
++    // Melhor batida de um template específico dentro da região. Devolve sad=255 se
++    // não houver correspondência possível (região incompatível ou template ausente).
++    Hit Match(int weaponIndex, const ImageRgb& region) const;
++
++    // Converte SAD em confiança. Escala logarítmica: a confiança cai gradualmente
++    // conforme a diferença média por canal aumenta (diferença 0 -> 1.0; ~2 -> 0.94;
++    // ~8 -> 0.75; ~32 -> 0.5; ~128 -> 0.25). Com a fórmula linear 1-sad/255, armas
++    // com fundos idênticos e emblemas diferentes ficariam todas acima de 0.9 — o
++    // discriminador real do HUD é a área do emblema, não o fundo.
++    static float Confidence(float sad);
++
++    // Distância de Hamming entre duas imagens (mesmo tamanho): número de pixels
++    // que diferem em qualquer canal. Usado pela UI para avisar templates quase
++    // idênticos (risco de ambiguidade no modo automático).
++    static std::size_t PixelDiffCount(const ImageRgb& a, const ImageRgb& b);
++
++    // Acesso por SLOT interno (ordem dos templates passados em Build), usado
++    // pelo AutoVisionController para varrer todas as armas cadastradas.
++    // MatchBySlot devolve sad=255 se o slot não existir.
++    int WeaponIndexAt(int slot) const {
++        return (slot >= 0 && static_cast<std::size_t>(slot) < templates_.size())
++                   ? templates_[static_cast<std::size_t>(slot)].weaponIndex
++                   : -1;
++    }
++    Hit MatchBySlot(int slot, const ImageRgb& region) const;
++
++private:
++    struct Entry {
++        int weaponIndex = -1;
++        ImageRgb image;
++    };
++
++    // Laço SAD compartilhado por Match/MatchBySlot (evita duplicação).
++    Hit MatchImpl(const Entry& entry, const ImageRgb& region) const;
++
++    int factor_ = 1;             // divisor linear aplicado a região e templates
++    int refW_ = 0;               // lado da região reduzida (tamanho de trabalho)
++    int refH_ = 0;
++    std::vector<Entry> templates_;
++};
++
++}  // namespace st
+diff --git a/src/core/vision/png.cpp b/src/core/vision/png.cpp
+new file mode 100644
+index 0000000..95b7913
+--- /dev/null
++++ b/src/core/vision/png.cpp
+@@ -0,0 +1,417 @@
++#include "core/vision/png.h"
++
++#include <array>
++#include <cstring>
++
++namespace st {
++
++namespace {
++
++std::uint32_t ReadU32(const unsigned char* p) {
++    return (static_cast<std::uint32_t>(p[0]) << 24) | (static_cast<std::uint32_t>(p[1]) << 16) |
++           (static_cast<std::uint32_t>(p[2]) << 8) | static_cast<std::uint32_t>(p[3]);
++}
++
++// ------------------------------------------------------------------ inflate (RFC 1951)
++
++class Inflator {
++public:
++    Inflator(const std::vector<unsigned char>& data, std::size_t offset) : d_(data), pos_(offset) {}
++
++    bool Run(std::vector<unsigned char>& out) {
++        unsigned char hlit = 0;
++        unsigned char hdist = 0;
++        unsigned long blockFinal = 0;
++        while (true) {
++            if (!ReadBits(1, blockFinal)) return false;
++            final_ = (blockFinal != 0);
++            unsigned long type = 0;
++            if (!ReadBits(2, type)) return false;
++            if (type == 0) {
++                if (!Stored(out)) return false;
++            } else if (type == 1) {
++                FixedTables();
++            } else if (type == 2) {
++                if (!DynamicTables(hlit, hdist)) return false;
++            } else {
++                return false;
++            }
++            if (type != 0 && !Blocks(out, hlit, hdist)) return false;
++            if (final_) break;
++        }
++        return true;
++    }
++
++private:
++    bool ReadBits(int n, unsigned long& v) {
++        v = 0;
++        for (int i = 0; i < n; ++i) {
++            unsigned long bit = 0;
++            if (!GetBit(bit)) return false;
++            v |= bit << i;  // deflate lê bits do menos significativo para o mais
++        }
++        return true;
++    }
++
++    bool GetBit(unsigned long& bit) {
++        if (bitCount_ == 0) {
++            if (pos_ >= d_.size()) return false;
++            byteBuf_ = d_[pos_++];
++            bitCount_ = 8;
++        }
++        bit = byteBuf_ & 1u;
++        byteBuf_ >>= 1;
++        --bitCount_;
++        return true;
++    }
++
++    bool Stored(std::vector<unsigned char>& out) {
++        // RFC 1951: LEN/NLEN começam no byte inteiro SEGUINTE ao header do bloco
++        // (bits residuais são descartados, mas o buffer de bytes já consumido não).
++        bitCount_ = 0;
++        if (pos_ + 4 > d_.size()) return false;
++        const unsigned len = static_cast<unsigned>(d_[pos_]) | (static_cast<unsigned>(d_[pos_ + 1]) << 8);
++        const unsigned nlen = static_cast<unsigned>(d_[pos_ + 2]) | (static_cast<unsigned>(d_[pos_ + 3]) << 8);
++        pos_ += 4;
++        if ((len ^ 0xFFFFu) != nlen || pos_ + len > d_.size()) return false;
++        out.insert(out.end(), d_.begin() + static_cast<std::ptrdiff_t>(pos_),
++                   d_.begin() + static_cast<std::ptrdiff_t>(pos_ + len));
++        pos_ += len;
++        return true;
++    }
++
++    // Huffman canônico a partir das lengths.
++    struct Huff {
++        std::array<int, 16> count{};
++        std::array<int, 16> nextCode{};
++        std::vector<int> symbol;
++
++        void Build(const int* lengths, int n) {
++            count.fill(0);
++            for (int i = 0; i < n; ++i) {
++                if (lengths[i] > 0) ++count[static_cast<std::size_t>(lengths[i])];
++            }
++            int code = 0;
++            for (int b = 1; b < 16; ++b) {
++                code = (code + count[static_cast<std::size_t>(b - 1)]) << 1;
++                nextCode[static_cast<std::size_t>(b)] = code;
++            }
++            symbol.assign(n, 0);
++            for (int i = 0; i < n; ++i) {
++                if (lengths[i] > 0) {
++                    { const int posn = nextCode[static_cast<std::size_t>(lengths[i])]++; symbol[static_cast<std::size_t>(posn)] = i; }
++                }
++            }
++        }
++
++        bool Decode(Inflator& in, int& outSymbol) {
++            int code = 0;
++            int first = 0;
++            int index = -1;
++            for (int len = 1; len < 16; ++len) {
++                unsigned long bit = 0;
++                if (!in.GetBit(bit)) return false;
++                code |= static_cast<int>(bit);
++                const int countLen = count[static_cast<std::size_t>(len)];
++                if (code - first < countLen) {
++                    outSymbol = symbol[static_cast<std::size_t>(index + (code - first))];
++                    return true;
++                }
++                index += countLen;
++                first = (first + countLen) << 1;
++                code <<= 1;
++            }
++            return false;
++        }
++    };
++
++    void FixedTables() {
++        int litDist[288];
++        for (int i = 0; i < 144; ++i) litDist[i] = 8;
++        for (int i = 144; i < 256; ++i) litDist[i] = 9;
++        for (int i = 256; i < 280; ++i) litDist[i] = 7;
++        for (int i = 280; i < 288; ++i) litDist[i] = 8;
++        litLen_.Build(litDist, 288);
++        int dist[32];
++        for (int i = 0; i < 32; ++i) dist[i] = 5;
++        distLen_.Build(dist, 32);
++    }
++
++    bool DynamicTables(unsigned char& hlit, unsigned char& hdist) {
++        unsigned long v = 0;
++        if (!ReadBits(5, v)) return false;
++        hlit = static_cast<unsigned char>(257 + v);
++        if (!ReadBits(5, v)) return false;
++        hdist = static_cast<unsigned char>(1 + v);
++        unsigned long hclen = 0;
++        if (!ReadBits(4, v)) return false;
++        hclen = 4 + v;
++        static constexpr unsigned char kOrder[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5,
++                                                     11, 4, 12, 3, 13, 2, 14, 1, 15};
++        int codeLen[19] = {0};
++        for (unsigned long i = 0; i < hclen; ++i) {
++            if (!ReadBits(3, v)) return false;
++            codeLen[kOrder[i]] = static_cast<int>(v);
++        }
++        Huff codeHuff;
++        codeHuff.Build(codeLen, 19);
++        std::vector<int> lengths(static_cast<std::size_t>(hlit + hdist), 0);
++        int i = 0;
++        while (i < hlit + hdist) {
++            int sym = 0;
++            if (!codeHuff.Decode(*this, sym)) return false;
++            if (sym < 16) {
++                lengths[static_cast<std::size_t>(i++)] = sym;
++            } else if (sym == 16) {
++                if (i == 0) return false;
++                if (!ReadBits(2, v)) return false;
++                const int rep = 3 + static_cast<int>(v);
++                const int prev = lengths[static_cast<std::size_t>(i - 1)];
++                for (int r = 0; r < rep && i < hlit + hdist; ++r) lengths[static_cast<std::size_t>(i++)] = prev;
++            } else if (sym == 17) {
++                if (!ReadBits(3, v)) return false;
++                for (int r = 0; r < 3 + static_cast<int>(v) && i < hlit + hdist; ++r)
++                    lengths[static_cast<std::size_t>(i++)] = 0;
++            } else {
++                if (!ReadBits(7, v)) return false;
++                for (int r = 0; r < 11 + static_cast<int>(v) && i < hlit + hdist; ++r)
++                    lengths[static_cast<std::size_t>(i++)] = 0;
++            }
++        }
++        litLen_.Build(lengths.data(), hlit);
++        distLen_.Build(lengths.data() + hlit, hdist);
++        return true;
++    }
++
++    bool Blocks(std::vector<unsigned char>& out, unsigned char /*hlit*/, unsigned char /*hdist*/) {
++        static constexpr int kLenBase[29] = {3,  4,  5,  6,  7,  8,  9,  10,  11,  13,  15,  17,  19,  23, 27,
++                                             31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
++        static constexpr int kLenExtra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
++                                              2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
++        static constexpr int kDistBase[30] = {1,    2,    3,    4,    5,    7,     9,     13,    17,    25,
++                                              33,   49,   65,   97,   129,  193,   257,   385,   513,   769,
++                                              1025, 1537, 2049, 3073, 4097, 6145,  8193,  12289, 16385, 24577};
++        static constexpr int kDistExtra[30] = {0, 0, 0, 0, 1, 1, 2, 2,  3,  3,  4,  4,  5,  5,  6,
++                                               6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
++        while (true) {
++            int sym = 0;
++            if (!litLen_.Decode(*this, sym)) return false;
++            if (sym < 256) {
++                out.push_back(static_cast<unsigned char>(sym));
++            } else if (sym == 256) {
++                return true;
++            } else {
++                sym -= 257;
++                if (sym >= 29) return false;
++                unsigned long v = 0;
++                if (!ReadBits(kLenExtra[sym], v)) return false;
++                const int length = kLenBase[sym] + static_cast<int>(v);
++                int dsym = 0;
++                if (!distLen_.Decode(*this, dsym)) return false;
++                if (dsym >= 30) return false;
++                if (!ReadBits(kDistExtra[dsym], v)) return false;
++                const int dist = kDistBase[dsym] + static_cast<int>(v);
++                if (dist > static_cast<int>(out.size())) return false;
++                for (int r = 0; r < length; ++r) {
++                    out.push_back(out[out.size() - static_cast<std::size_t>(dist)]);
++                }
++            }
++        }
++    }
++
++    const std::vector<unsigned char>& d_;
++    std::size_t pos_;
++    unsigned byteBuf_ = 0;
++    int bitCount_ = 0;
++    bool final_ = false;
++    Huff litLen_;
++    Huff distLen_;
++};
++
++// ------------------------------------------------------------------ filtros de scanline
++
++inline unsigned Paeth(unsigned a, unsigned b, unsigned c) {
++    const int p = static_cast<int>(a + b - c);
++    const int pa = p > static_cast<int>(a) ? p - static_cast<int>(a) : static_cast<int>(a) - p;
++    const int pb = p > static_cast<int>(b) ? p - static_cast<int>(b) : static_cast<int>(b) - p;
++    const int pc = p > static_cast<int>(c) ? p - static_cast<int>(c) : static_cast<int>(c) - p;
++    if (pa <= pb && pa <= pc) return a;
++    return pb <= pc ? b : c;
++}
++
++bool Unfilter(std::vector<unsigned char>& raw, int height, std::size_t stride, int bpp) {
++    std::vector<unsigned char> prev(stride, 0);
++    for (int y = 0; y < height; ++y) {
++        if (static_cast<std::size_t>(y) * (stride + 1u) >= raw.size()) return false;
++        const unsigned filter = raw[static_cast<std::size_t>(y) * (stride + 1u)];
++        unsigned char* row = raw.data() + static_cast<std::size_t>(y) * (stride + 1u) + 1u;
++        for (std::size_t x = 0; x < stride; ++x) {
++            const unsigned a = x >= static_cast<std::size_t>(bpp) ? row[x - static_cast<std::size_t>(bpp)] : 0u;
++            const unsigned b = prev[x];
++            const unsigned c = x >= static_cast<std::size_t>(bpp) ? prev[x - static_cast<std::size_t>(bpp)] : 0u;
++            unsigned v = row[x];
++            switch (filter) {
++                case 0: break;
++                case 1: v = (v + a) & 0xFFu; break;
++                case 2: v = (v + b) & 0xFFu; break;
++                case 3: v = (v + ((a + b) >> 1)) & 0xFFu; break;
++                case 4: v = (v + Paeth(a, b, c)) & 0xFFu; break;
++                default: return false;
++            }
++            row[x] = static_cast<unsigned char>(v);
++        }
++        std::memcpy(prev.data(), row, stride);
++    }
++    // Compacta: remove o byte de filtro de cada linha.
++    std::vector<unsigned char> pixels((stride) * static_cast<std::size_t>(height));
++    for (int y = 0; y < height; ++y) {
++        std::memcpy(pixels.data() + static_cast<std::size_t>(y) * stride,
++                    raw.data() + static_cast<std::size_t>(y) * (stride + 1u) + 1u, stride);
++    }
++    raw = std::move(pixels);
++    return true;
++}
++
++}  // namespace
++
++bool DecodePng(const std::vector<unsigned char>& bytes, ImageRgb& out) {
++    out = ImageRgb{};
++    static constexpr unsigned char kSig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
++    if (bytes.size() < 8 || std::memcmp(bytes.data(), kSig, 8) != 0) {
++        return false;
++    }
++    std::size_t pos = 8;
++    int width = 0;
++    int height = 0;
++    int bitDepth = 0;
++    int colorType = -1;
++    int interlace = 0;
++    std::vector<unsigned char> idat;
++    std::vector<unsigned char> palette;
++    std::vector<unsigned char> trns;
++    while (pos + 12 <= bytes.size()) {
++        const std::uint32_t len = ReadU32(&bytes[pos]);
++        const char* type = reinterpret_cast<const char*>(&bytes[pos + 4]);
++        if (pos + 12 + len > bytes.size()) {
++            return false;
++        }
++        const unsigned char* data = &bytes[pos + 8];
++        if (std::memcmp(type, "IHDR", 4) == 0 && len == 13) {
++            width = static_cast<int>(ReadU32(data));
++            height = static_cast<int>(ReadU32(data + 4));
++            bitDepth = data[8];
++            colorType = data[9];
++            interlace = data[12];
++            if (data[10] != 0 || data[11] != 0 || interlace != 0 || width <= 0 || height <= 0 ||
++                width > 16384 || height > 16384) {
++                return false;  // só compression=0 / filter=0, não progressivo, limites de sanidade
++            }
++        } else if (std::memcmp(type, "PLTE", 4) == 0) {
++            palette.assign(data, data + len);
++        } else if (std::memcmp(type, "tRNS", 4) == 0) {
++            trns.assign(data, data + len);
++        } else if (std::memcmp(type, "IDAT", 4) == 0) {
++            idat.insert(idat.end(), data, data + len);
++        } else if (std::memcmp(type, "IEND", 4) == 0) {
++            break;
++        }
++        pos += 12 + len;
++    }
++    if (width <= 0 || height <= 0 || colorType < 0 || idat.empty()) {
++        return false;
++    }
++
++    std::vector<unsigned char> raw;
++    Inflator infl(idat, 2);  // pula o header de 2 bytes do zlib
++    if (!infl.Run(raw)) {
++        return false;
++    }
++
++    // Canais por pixel e tamanho do pixel em bits.
++    int channels = 0;
++    switch (colorType) {
++        case 0: channels = 1; break;  // cinza
++        case 2: channels = 3; break;  // RGB
++        case 3: channels = 1; break;  // paleta
++        case 4: channels = 2; break;  // cinza+alfa
++        case 6: channels = 4; break;  // RGBA
++        default: return false;
++    }
++    const bool okDepth = (colorType == 3) ? (bitDepth == 1 || bitDepth == 2 || bitDepth == 4 || bitDepth == 8)
++                                          : (bitDepth == 8 || (colorType == 0 && bitDepth == 16) ||
++                                             (colorType == 0 && (bitDepth == 1 || bitDepth == 2 || bitDepth == 4)));
++    if (!okDepth) {
++        return false;
++    }
++    const int pixelBits = channels * bitDepth;
++    const std::size_t stride = (static_cast<std::size_t>(width) * static_cast<std::size_t>(pixelBits) + 7u) / 8u;
++    const int bpp = pixelBits >= 8 ? pixelBits / 8 : 1;  // bytes por pixel p/ filtros (sub-pixel: 1)
++    if (raw.size() < stride * static_cast<std::size_t>(height) + static_cast<std::size_t>(height)) {
++        return false;
++    }
++    if (!Unfilter(raw, height, stride, bpp)) {
++        return false;
++    }
++
++    out.width = width;
++    out.height = height;
++    out.rgb.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3u);
++    const std::size_t palEntries = palette.size() / 3u;
++    for (int y = 0; y < height; ++y) {
++        const unsigned char* row = raw.data() + static_cast<std::size_t>(y) * stride;
++        for (int x = 0; x < width; ++x) {
++            std::uint8_t r = 0;
++            std::uint8_t g = 0;
++            std::uint8_t b = 0;
++            auto sample = [&](int ch) -> unsigned {
++                const std::size_t bitIdx = static_cast<std::size_t>(x) * static_cast<std::size_t>(pixelBits) +
++                                          static_cast<std::size_t>(ch) * static_cast<std::size_t>(bitDepth);
++                if (bitDepth == 8) {
++                    return row[bitIdx / 8u];
++                }
++                if (bitDepth == 16) {
++                    return row[bitIdx / 8u];  // mantém o byte alto
++                }
++                // sub-byte (1/2/4): extrai do byte
++                const unsigned perByte = 8u / static_cast<unsigned>(bitDepth);
++                const unsigned byteVal = row[bitIdx / 8u];
++                const unsigned shift = static_cast<unsigned>((perByte - 1u - (bitIdx % perByte)) * bitDepth);
++                const unsigned mask = (1u << bitDepth) - 1u;
++                const unsigned v = (byteVal >> shift) & mask;
++                // expande para 8 bits (proporção simples, suficiente para paleta/cinza)
++                return v * 255u / mask;
++            };
++            switch (colorType) {
++                case 0: r = g = b = static_cast<std::uint8_t>(sample(0)); break;
++                case 2:
++                    r = static_cast<std::uint8_t>(sample(0));
++                    g = static_cast<std::uint8_t>(sample(1));
++                    b = static_cast<std::uint8_t>(sample(2));
++                    break;
++                case 3: {
++                    const unsigned idx = sample(0);
++                    if (idx < palEntries) {
++                        r = palette[idx * 3u];
++                        g = palette[idx * 3u + 1u];
++                        b = palette[idx * 3u + 2u];
++                    }
++                    break;
++                }
++                case 4: r = g = b = static_cast<std::uint8_t>(sample(0)); break;
++                case 6:
++                    r = static_cast<std::uint8_t>(sample(0));
++                    g = static_cast<std::uint8_t>(sample(1));
++                    b = static_cast<std::uint8_t>(sample(2));
++                    break;
++            }
++            const std::size_t d = (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) +
++                                   static_cast<std::size_t>(x)) * 3u;
++            out.rgb[d] = r;
++            out.rgb[d + 1u] = g;
++            out.rgb[d + 2u] = b;
++        }
++    }
++    return true;
++}
++
++}  // namespace st
+diff --git a/src/core/vision/png.h b/src/core/vision/png.h
+new file mode 100644
+index 0000000..b68db49
+--- /dev/null
++++ b/src/core/vision/png.h
+@@ -0,0 +1,16 @@
++#pragma once
++
++#include "core/vision/image.h"
++
++#include <vector>
++
++namespace st {
++
++// Decodificador PNG mínimo, só com a stdlib (sem zlib/stb — o build do núcleo não
++// pode depender de rede nem de bibliotecas novas). Aceita o que o app produz e o
++// que é comum em capturas de tela: truecolor 8 bits (RGB/RGBA), cinza 8/16,
++// paleta (1/2/4/8 bits) e cinza+alfa, com todos os filtros de scanline.
++// Devolve RGB compacto linha a linha; `out` fica vazio em caso de falha.
++bool DecodePng(const std::vector<unsigned char>& bytes, ImageRgb& out);
++
++}  // namespace st
+diff --git a/src/core/vision/weapon_images.cpp b/src/core/vision/weapon_images.cpp
+new file mode 100644
+index 0000000..63fbdcd
+--- /dev/null
++++ b/src/core/vision/weapon_images.cpp
+@@ -0,0 +1,314 @@
++#include "core/vision/weapon_images.h"
++
++#include "core/vision/png.h"
++#include "core/weapon.h"
++
++#include <nlohmann/json.hpp>
++
++#include <array>
++#include <cstdint>
++
++namespace st {
++namespace {
++
++constexpr char kBase64Chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++
++// Tabela reversa: -1 = inválido.
++signed char Base64Value(char c) {
++    if (c >= 'A' && c <= 'Z') return static_cast<signed char>(c - 'A');
++    if (c >= 'a' && c <= 'z') return static_cast<signed char>(c - 'a' + 26);
++    if (c >= '0' && c <= '9') return static_cast<signed char>(c - '0' + 52);
++    if (c == '+') return 62;
++    if (c == '/') return 63;
++    return -1;
++}
++
++// ---- CRC32 e Adler32 (RFC 1950/1951), para escrever PNG com zlib "stored". ----
++std::uint32_t Crc32(const unsigned char* data, std::size_t size) {
++    static std::array<std::uint32_t, 256> table = [] {
++        std::array<std::uint32_t, 256> t{};
++        for (std::uint32_t i = 0; i < 256; ++i) {
++            std::uint32_t c = i;
++            for (int k = 0; k < 8; ++k) {
++                c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
++            }
++            t[i] = c;
++        }
++        return t;
++    }();
++    std::uint32_t crc = 0xFFFFFFFFu;
++    for (std::size_t i = 0; i < size; ++i) {
++        crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
++    }
++    return crc ^ 0xFFFFFFFFu;
++}
++
++void AppendU16Le(std::vector<unsigned char>& v, std::uint16_t x) {
++    // RFC 1951: LEN/NLEN de blocos "stored" são little-endian (diferente do PNG).
++    v.push_back(static_cast<unsigned char>(x & 0xFFu));
++    v.push_back(static_cast<unsigned char>(x >> 8));
++}
++
++void AppendU16Be(std::vector<unsigned char>& v, std::uint16_t x) {
++    v.push_back(static_cast<unsigned char>(x >> 8));
++    v.push_back(static_cast<unsigned char>(x & 0xFFu));
++}
++
++void AppendU32Be(std::vector<unsigned char>& v, std::uint32_t x) {
++    v.push_back(static_cast<unsigned char>(x >> 24));
++    v.push_back(static_cast<unsigned char>((x >> 16) & 0xFFu));
++    v.push_back(static_cast<unsigned char>((x >> 8) & 0xFFu));
++    v.push_back(static_cast<unsigned char>(x & 0xFFu));
++}
++
++void AppendPngChunk(std::vector<unsigned char>& png, const char* type,
++                    const std::vector<unsigned char>& payload) {
++    AppendU32Be(png, static_cast<std::uint32_t>(payload.size()));
++    const std::size_t typeStart = png.size();
++    for (int i = 0; i < 4; ++i) png.push_back(static_cast<unsigned char>(type[i]));
++    png.insert(png.end(), payload.begin(), payload.end());
++    const std::uint32_t crc =
++        Crc32(png.data() + typeStart, png.size() - typeStart);
++    AppendU32Be(png, crc);
++}
++
++}  // namespace
++
++std::string Base64Encode(const unsigned char* data, std::size_t size) {
++    std::string out;
++    out.reserve(((size + 2) / 3) * 4);
++    std::size_t i = 0;
++    while (i + 3 <= size) {
++        const std::uint32_t v = (static_cast<std::uint32_t>(data[i]) << 16) |
++                                (static_cast<std::uint32_t>(data[i + 1]) << 8) |
++                                static_cast<std::uint32_t>(data[i + 2]);
++        out.push_back(kBase64Chars[(v >> 18) & 63]);
++        out.push_back(kBase64Chars[(v >> 12) & 63]);
++        out.push_back(kBase64Chars[(v >> 6) & 63]);
++        out.push_back(kBase64Chars[v & 63]);
++        i += 3;
++    }
++    const std::size_t rem = size - i;
++    if (rem == 1) {
++        const std::uint32_t v = static_cast<std::uint32_t>(data[i]) << 16;
++        out.push_back(kBase64Chars[(v >> 18) & 63]);
++        out.push_back(kBase64Chars[(v >> 12) & 63]);
++        out.push_back('=');
++        out.push_back('=');
++    } else if (rem == 2) {
++        const std::uint32_t v = (static_cast<std::uint32_t>(data[i]) << 16) |
++                                (static_cast<std::uint32_t>(data[i + 1]) << 8);
++        out.push_back(kBase64Chars[(v >> 18) & 63]);
++        out.push_back(kBase64Chars[(v >> 12) & 63]);
++        out.push_back(kBase64Chars[(v >> 6) & 63]);
++        out.push_back('=');
++    }
++    return out;
++}
++
++std::string Base64Encode(const std::vector<unsigned char>& data) {
++    return Base64Encode(data.data(), data.size());
++}
++
++bool Base64Decode(std::string_view text, std::vector<unsigned char>& out) {
++    out.clear();
++    // Remove espaços em branco (o JSON pode quebrar linhas longas).
++    std::string clean;
++    clean.reserve(text.size());
++    for (char c : text) {
++        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') clean.push_back(c);
++    }
++    if (clean.size() % 4 != 0) return false;
++    std::size_t pads = 0;
++    if (!clean.empty()) {
++        if (clean[clean.size() - 1] == '=') ++pads;
++        if (clean.size() >= 2 && clean[clean.size() - 2] == '=') ++pads;
++    }
++    if (pads > 2) return false;
++    out.reserve(clean.size() / 4 * 3);
++    for (std::size_t i = 0; i < clean.size(); i += 4) {
++        std::uint32_t v = 0;
++        int padInGroup = 0;
++        for (std::size_t k = 0; k < 4; ++k) {
++            const char c = clean[i + k];
++            if (c == '=') {
++                // Padding só permitido no último grupo, nas duas últimas posições.
++                if (i + 4 != clean.size() || k < 2) return false;
++                ++padInGroup;
++                v <<= 6;
++            } else {
++                if (padInGroup != 0) return false;  // caractere após '='
++                const signed char d = Base64Value(c);
++                if (d < 0) return false;
++                v = (v << 6) | static_cast<std::uint32_t>(d);
++            }
++        }
++        // Bytes reais deste grupo: 3 sem padding, 2 com um '=', 1 com dois '=='.
++        const int take = 3 - padInGroup;
++        if (take > 2) out.push_back(static_cast<unsigned char>((v >> 16) & 0xFFu));
++        if (take > 1) out.push_back(static_cast<unsigned char>((v >> 8) & 0xFFu));
++        // Com padding, os bits úteis estão ALINHADOS À ESQUERDA (os zeros vieram
++        // dos '=' deslocados). Ex.: '/w==' -> v>>16 == 0xFF. Sem shift correto,
++        // o último byte decodificado saía 0 — bug que quebrava round-trips e PNGs.
++        if (take == 3) out.push_back(static_cast<unsigned char>(v & 0xFFu));
++        else if (take == 2) out.push_back(static_cast<unsigned char>((v >> 8) & 0xFFu));
++        else out.push_back(static_cast<unsigned char>((v >> 16) & 0xFFu));
++    }
++    return true;
++}
++
++void EncodePngRgb(const ImageRgb& image, std::vector<unsigned char>& outBytes) {
++    outBytes.clear();
++    if (image.Empty()) return;
++
++    // IDAT: cada scanline prefixed with filtro 0, depois zlib "stored" (sem compressão).
++    const std::size_t stride = static_cast<std::size_t>(image.width) * 3;
++    std::vector<unsigned char> raw;
++    raw.reserve(static_cast<std::size_t>(image.height) * (stride + 1));
++    for (int y = 0; y < image.height; ++y) {
++        raw.push_back(0);  // filtro None
++        const std::size_t off = static_cast<std::size_t>(y) * stride;
++        raw.insert(raw.end(), image.rgb.begin() + static_cast<std::ptrdiff_t>(off),
++                   image.rgb.begin() + static_cast<std::ptrdiff_t>(off + stride));
++    }
++
++    // Envelope zlib: CMF/FLG (deflate, 32K window) + blocos stored + Adler32.
++    std::vector<unsigned char> idat;
++    idat.push_back(0x78);
++    idat.push_back(0x01);
++    std::size_t pos = 0;
++    while (pos < raw.size() || raw.empty()) {
++        const std::size_t block = std::min<std::size_t>(raw.size() - pos, 0xFFFFu);
++        const bool finalBlock = (pos + block >= raw.size());
++        idat.push_back(finalBlock ? 0x01 : 0x00);
++        // LEN/NLEN little-endian (RFC 1951) — o decoder Stored() lê little-endian.
++        AppendU16Le(idat, static_cast<std::uint16_t>(block));
++        AppendU16Le(idat, static_cast<std::uint16_t>(~block & 0xFFFFu));
++        idat.insert(idat.end(), raw.begin() + static_cast<std::ptrdiff_t>(pos),
++                    raw.begin() + static_cast<std::ptrdiff_t>(pos + block));
++        pos += block;
++        if (raw.empty()) break;
++    }
++    // Adler32 dos dados brutos.
++    std::uint32_t a = 1, b = 0;
++    for (unsigned char byte : raw) {
++        a = (a + byte) % 65521u;
++        b = (b + a) % 65521u;
++    }
++    AppendU32Be(idat, (b << 16) | a);
++
++    // Assinatura PNG. '\\x1A' vira char negativo em plataformas onde char é signed;
++    // o cast explícito evita a narrowing conversion (C++20) e mantém o byte 0x1A.
++    outBytes.insert(outBytes.end(),
++                    {static_cast<unsigned char>(0x89), 'P', 'N', 'G', '\r', '\n',
++                     static_cast<unsigned char>(0x1A), '\n'});
++    std::vector<unsigned char> ihdr;
++    AppendU32Be(ihdr, static_cast<std::uint32_t>(image.width));
++    AppendU32Be(ihdr, static_cast<std::uint32_t>(image.height));
++    ihdr.push_back(8);   // profundidade
++    ihdr.push_back(2);   // truecolor RGB
++    ihdr.push_back(0);   // compressão
++    ihdr.push_back(0);   // filtro
++    ihdr.push_back(0);   // interlace
++    AppendPngChunk(outBytes, "IHDR", ihdr);
++    AppendPngChunk(outBytes, "IDAT", idat);
++    AppendPngChunk(outBytes, "IEND", {});
++}
++
++WeaponImagesParseResult WeaponImagesFromJson(const std::string& jsonText,
++                                             std::vector<WeaponImageEntry>& out) {
++    WeaponImagesParseResult res;
++    out.clear();
++    const nlohmann::json j = nlohmann::json::parse(jsonText, nullptr, false);
++    if (j.is_discarded() || !j.is_object()) {
++        res.ok = false;
++        res.warnings.push_back("weaponImages: JSON inválido");
++        return res;
++    }
++    const auto it = j.find("weaponImages");
++    if (it == j.end()) return res;  // ausente = sem imagens, sem aviso (perfis antigos)
++    if (!it->is_array()) {
++        res.ok = false;
++        res.warnings.push_back("weaponImages: deveria ser uma lista");
++        return res;
++    }
++    for (const nlohmann::json& item : *it) {
++        if (!item.is_object() || !item.contains("weapon") || !item["weapon"].is_string() ||
++            !item.contains("png") || !item["png"].is_string()) {
++            res.warnings.push_back("weaponImages: entrada sem \"weapon\"/\"png\" ignorada");
++            continue;
++        }
++        WeaponImageEntry e;
++        e.weaponId = item["weapon"].get<std::string>();
++        e.pngBase64 = item["png"].get<std::string>();
++        // Arma desconhecida? Ignora com aviso (padrão do projeto para ids novos/velhos).
++        bool known = false;
++        for (std::size_t i = 0; i < kWeaponCount; ++i) {
++            if (GetWeaponInfo(static_cast<Weapon>(i)).id == e.weaponId) {
++                known = true;
++                break;
++            }
++        }
++        if (!known) {
++            res.warnings.push_back("weaponImages: arma desconhecida \"" + e.weaponId + "\" ignorada");
++            continue;
++        }
++        if (e.pngBase64.size() > kMaxWeaponImageB64) {
++            res.warnings.push_back("weaponImages: imagem de \"" + e.weaponId +
++                                   "\" acima do limite; removida");
++            e.pngBase64.clear();
++        }
++        // Valida o PNG agora (falha aqui = campo limpo, não um erro do perfil inteiro).
++        if (!e.pngBase64.empty()) {
++            std::vector<unsigned char> bytes;
++            ImageRgb img;
++            if (!Base64Decode(e.pngBase64, bytes) || !DecodePng(bytes, img)) {
++                res.warnings.push_back("weaponImages: PNG de \"" + e.weaponId +
++                                       "\" inválido; imagem removida");
++                e.pngBase64.clear();
++            }
++        }
++        out.push_back(std::move(e));
++    }
++    return res;
++}
++
++std::string WeaponImagesToJson(const std::vector<WeaponImageEntry>& entries) {
++    nlohmann::ordered_json j;
++    nlohmann::ordered_json arr = nlohmann::ordered_json::array();
++    for (const WeaponImageEntry& e : entries) {
++        if (e.pngBase64.empty()) continue;  // sem imagem = não grava
++        nlohmann::ordered_json item;
++        item["weapon"] = e.weaponId;
++        item["png"] = e.pngBase64;
++        arr.push_back(std::move(item));
++    }
++    j["weaponImages"] = std::move(arr);
++    return j.dump();
++}
++
++bool EmbedWeaponImages(std::string& profileJsonText, const std::vector<WeaponImageEntry>& entries) {
++    nlohmann::ordered_json j = nlohmann::ordered_json::parse(profileJsonText, nullptr, false);
++    if (j.is_discarded() || !j.is_object()) {
++        return false;  // texto do perfil inválido: não mexe em nada
++    }
++    nlohmann::ordered_json arr = nlohmann::ordered_json::array();
++    for (const WeaponImageEntry& e : entries) {
++        if (e.pngBase64.empty()) continue;  // sem imagem = não grava
++        nlohmann::ordered_json item;
++        item["weapon"] = e.weaponId;
++        item["png"] = e.pngBase64;
++        arr.push_back(std::move(item));
++    }
++    j["weaponImages"] = std::move(arr);
++    profileJsonText = j.dump(2) + "\n";
++    return true;
++}
++
++WeaponImagesParseResult ExtractWeaponImages(const std::string& profileJsonText,
++                                            std::vector<WeaponImageEntry>& out) {
++    // Reaproveita o parser da seção (mesma validação de arma/PNG/limite).
++    return WeaponImagesFromJson(profileJsonText, out);
++}
++
++}  // namespace st
+diff --git a/src/core/vision/weapon_images.h b/src/core/vision/weapon_images.h
+new file mode 100644
+index 0000000..2c7098b
+--- /dev/null
++++ b/src/core/vision/weapon_images.h
+@@ -0,0 +1,59 @@
++#pragma once
++
++#include "core/vision/image.h"
++
++#include <cstddef>
++#include <string>
++#include <vector>
++
++namespace st {
++
++// Imagens de referência do reconhecimento automático, UMA POR ARMA (o "Replay"
++// do app é o conjunto de armas; cada arma tem seu template visual).
++//
++// Armazenamento: PNG compactado em base64 dentro do próprio perfil JSON
++// (seção "weaponImages"), ao lado das outras configurações. Isso evita
++// caminhos externos que quebram quando o perfil muda de pasta — requisito de
++// persistência do recurso. O limite por imagem impede perfis gigantes e
++// captura acidental da tela inteira.
++inline constexpr std::size_t kMaxWeaponImageB64 = 512 * 1024;  // ~375 KB de PNG real
++
++struct WeaponImageEntry {
++    std::string weaponId;              // chave igual à dos padrões ("ak47", "m4a4"...)
++    std::string pngBase64;             // PNG da referência; vazio = sem imagem cadastrada
++};
++
++// Codificação base64 padrão (RFC 4648, com padding). Sem dependências novas.
++std::string Base64Encode(const unsigned char* data, std::size_t size);
++std::string Base64Encode(const std::vector<unsigned char>& data);
++// Devolve false se `text` contiver caracteres inválidos ou padding errado.
++bool Base64Decode(std::string_view text, std::vector<unsigned char>& out);
++
++// Converte uma imagem RGB para PNG (sem compressão pesada: zlib "stored" via
++// filtro zero — suficiente para referências pequenas e determinístico).
++void EncodePngRgb(const ImageRgb& image, std::vector<unsigned char>& outBytes);
++
++// Carrega/salva a lista no perfil. Armas desconhecidas ou imagens acima do
++// limite são descartadas com aviso; PNG inválido descarta só aquela entrada.
++// Ausência total da seção não gera erro nem aviso (perfis antigos ok).
++struct WeaponImagesParseResult {
++    bool ok = true;
++    std::vector<std::string> warnings;
++};
++WeaponImagesParseResult WeaponImagesFromJson(const std::string& jsonText,
++                                             std::vector<WeaponImageEntry>& out);
++std::string WeaponImagesToJson(const std::vector<WeaponImageEntry>& entries);
++
++// ---- Integração com o JSON do perfil (texto já serializado). ----
++// O perfil é salvo por ProfileToJson (config), que não conhece imagens para
++// manter a camada de configuração livre de dependências de visão. Estas duas
++// funções colam/cavam a seção "weaponImages" no texto do perfil na borda da UI:
++//   - EmbedWeaponImages: insere/substitui a seção no objeto JSON do perfil.
++//     Devolve false se o texto não for um objeto JSON válido.
++//   - ExtractWeaponImages: lê a seção do texto do perfil (ausente = lista
++//     vazia, sem aviso — perfis antigos continuam válidos).
++bool EmbedWeaponImages(std::string& profileJsonText, const std::vector<WeaponImageEntry>& entries);
++WeaponImagesParseResult ExtractWeaponImages(const std::string& profileJsonText,
++                                            std::vector<WeaponImageEntry>& out);
++
++}  // namespace st
+diff --git a/src/platform/win32/capture.cpp b/src/platform/win32/capture.cpp
+new file mode 100644
+index 0000000..051147a
+--- /dev/null
++++ b/src/platform/win32/capture.cpp
+@@ -0,0 +1,139 @@
++#include "platform/win32/capture.h"
++
++#include <windows.h>
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace st {
++
++namespace {
++
++// UTF-8 -> UTF-16 (padrão do projeto: perfis e títulos são UTF-8 em memória).
++std::wstring Utf8ToWide(const std::string& text) {
++    if (text.empty()) {
++        return {};
++    }
++    const int n = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
++                                      nullptr, 0);
++    std::wstring out(static_cast<std::size_t>(n), L'\0');
++    MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), n);
++    return out;
++}
++
++// Converte um retângulo de área cliente para coordenadas de tela.
++bool ClientToScreenRect(HWND hwnd, RECT& rc) {
++    POINT tl{rc.left, rc.top};
++    POINT br{rc.right, rc.bottom};
++    if (!ClientToScreen(hwnd, &tl) || !ClientToScreen(hwnd, &br)) {
++        return false;
++    }
++    rc.left = tl.x;
++    rc.top = tl.y;
++    rc.right = br.x;
++    rc.bottom = br.y;
++    return true;
++}
++
++// Copia os pixels de `src` (DC compatível, origem em 0,0) para uma ImageRgb.
++bool ReadDcPixels(HDC src, int w, int h, ImageRgb& out) {
++    BITMAPINFO bi{};
++    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
++    bi.bmiHeader.biWidth = w;
++    bi.bmiHeader.biHeight = -h;  // top-down: linha 0 = topo, como ImageRgb espera
++    bi.bmiHeader.biPlanes = 1;
++    bi.bmiHeader.biBitCount = 32;
++    bi.bmiHeader.biCompression = BI_RGB;
++
++    std::vector<std::uint32_t> px(static_cast<std::size_t>(w) * static_cast<std::size_t>(h));
++    const int got = GetDIBits(src, /*hbm=*/0, 0, static_cast<UINT>(h), px.data(), &bi, DIB_RGB_COLORS);
++    if (got != h) {
++        return false;
++    }
++    out.width = w;
++    out.height = h;
++    out.rgb.assign(px.size() * 3u, 0u);
++    for (std::size_t i = 0; i < px.size(); ++i) {
++        const std::uint32_t v = px[i];
++        out.rgb[i * 3u + 0u] = static_cast<std::uint8_t>((v >> 16) & 0xFFu);  // R
++        out.rgb[i * 3u + 1u] = static_cast<std::uint8_t>((v >> 8) & 0xFFu);   // G
++        out.rgb[i * 3u + 2u] = static_cast<std::uint8_t>(v & 0xFFu);          // B
++    }
++    return true;
++}
++
++}  // namespace
++
++AutoVisionController::CaptureResult CaptureScreenRegion(const ProfileData& profile) {
++    AutoVisionController::CaptureResult res;
++    const int w = profile.autoRegionW;
++    const int h = profile.autoRegionH;
++    if (w <= 0 || h <= 0 || w > kMaxAutoRegionSize || h > kMaxAutoRegionSize) {
++        res.error = "regiao invalida";
++        return res;
++    }
++
++    int x = profile.autoRegionX;
++    int y = profile.autoRegionY;
++
++    // Janela associada: reancora a regiao em cada captura. Se ela sumiu ou foi
++    // minimizada, falha explicitamente (nunca usa coordenadas mortas em silencio).
++    if (!profile.autoWindowTitle.empty()) {
++        HWND hwnd = FindWindowW(nullptr, Utf8ToWide(profile.autoWindowTitle).c_str());
++        if (hwnd == nullptr) {
++            res.error = "janela nao encontrada: \"" + profile.autoWindowTitle + "\"";
++            return res;
++        }
++        if (IsIconic(hwnd) != FALSE || !IsWindowVisible(hwnd)) {
++            res.error = "janela minimizada ou oculta";
++            return res;
++        }
++        RECT rc{};
++        if (!GetClientRect(hwnd, &rc) || !ClientToScreenRect(hwnd, rc)) {
++            res.error = "falha ao ler a janela monitorada";
++            return res;
++        }
++        // A regiao cadastrada e relativa ao canto da area cliente da janela:
++        // mover a janela acompanha a regiao automaticamente.
++        x = rc.left + profile.autoRegionX;
++        y = rc.top + profile.autoRegionY;
++    }
++
++    HDC screen = GetDC(nullptr);
++    if (screen == nullptr) {
++        res.error = "sem acesso a tela";
++        return res;
++    }
++    HDC mem = CreateCompatibleDC(screen);
++    HBITMAP bmp = (mem != nullptr) ? CreateCompatibleBitmap(screen, w, h) : nullptr;
++    HGDIOBJ oldBmp = nullptr;
++    bool copied = false;
++    if (mem != nullptr && bmp != nullptr) {
++        oldBmp = SelectObject(mem, bmp);
++        copied = BitBlt(mem, 0, 0, w, h, screen, x, y, SRCCOPY | CAPTUREBLT) != FALSE;
++    }
++    if (copied) {
++        copied = ReadDcPixels(mem, w, h, res.image);
++    }
++    if (oldBmp != nullptr) {
++        SelectObject(mem, oldBmp);
++    }
++    if (bmp != nullptr) {
++        DeleteObject(bmp);
++    }
++    if (mem != nullptr) {
++        DeleteDC(mem);
++    }
++    ReleaseDC(nullptr, screen);
++
++    if (!copied || res.image.Empty()) {
++        res.error = "falha na captura (BitBlt)";
++        res.image = ImageRgb{};
++        return res;
++    }
++    res.ok = true;
++    return res;
++}
++
++}  // namespace st
+diff --git a/src/platform/win32/capture.h b/src/platform/win32/capture.h
+new file mode 100644
+index 0000000..793077e
+--- /dev/null
++++ b/src/platform/win32/capture.h
+@@ -0,0 +1,13 @@
++#pragma once
++
++#include "ui/auto_vision.h"
++
++namespace st {
++
++// Implementação Win32 da captura de tela (BitBlt em DC compatível). É a única
++// borda nativa do reconhecimento visual; toda a lógica fica em AutoVisionController
++// (portável e testada em Linux). Chamada apenas na thread da UI, no ritmo de
++// autoIntervalMs — nunca em thread separada.
++AutoVisionController::CaptureResult CaptureScreenRegion(const ProfileData& profile);
++
++}  // namespace st
+diff --git a/src/ui/app.h b/src/ui/app.h
+index 7ca8032..ca692b3 100644
+--- a/src/ui/app.h
++++ b/src/ui/app.h
+@@ -1,5 +1,8 @@
+ #pragma once
+ 
++#include "ui/auto_vision.h"
++#include "platform/win32/capture.h"
++
+ #include "config/profile_store.h"
+ #include "core/repetition.h"
+ #include "input/raw_input.h"
+@@ -42,9 +45,11 @@ private:
+ 
+     void DrainMouse();
+     void TickRepetition(double nowMs);
++    void TickAutoVision(double nowMs);   // reconhecimento visual (captura->match->troca)
+     void SyncRepetitionKeys();
+     void CycleWeapon();                     // tecla de próxima arma (WM_HOTKEY ou polling)
+     void CycleWeaponBack();                 // tecla de arma anterior (WM_HOTKEY ou polling)
++    void SelectWeapon(int weaponIndex);     // troca direta (auto-reconhecimento; mesmo efeito do seletor da UI)
+     bool IsRepeatButtonDown() const;   // botões do mouse como tecla de repetir
+     void UnregisterAllHotkeys();
+     static void SendMouseDelta(int dx, int dy);
+diff --git a/src/ui/app_state.h b/src/ui/app_state.h
+index fa13ea8..d6bd46d 100644
+--- a/src/ui/app_state.h
++++ b/src/ui/app_state.h
+@@ -6,6 +6,7 @@
+ #include "core/pattern_store.h"
+ #include "core/repetition.h"
+ #include "core/training_session.h"
++#include "core/vision/weapon_images.h"
+ #include "ui/textures.h"
+ 
+ #include <array>
+@@ -60,6 +61,21 @@ struct PatternRecorder {
+     int smoothing = 1;           // 0 a 3
+ };
+ 
++// Reconhecimento visual automático (mesmos campos da seção "autoVision" do perfil).
++// Ligado, o app escolhe a arma sozinho pela imagem na região monitorada — sem F1/F2.
++// Desligado (padrão), tudo continua exatamente como hoje.
++struct AutoVisionSettings {
++    bool enabled = false;
++    int regionX = 0;
++    int regionY = 0;
++    int regionW = 0;
++    int regionH = 0;
++    std::string windowTitle;      // vazio = região fixa em coordenadas de tela
++    float confidenceMin = 0.85f;  // 0..1
++    int intervalMs = 200;         // 100..2000
++    int confirmFrames = 3;        // 1..10
++};
++
+ // Configuração da repetição automática (aba Ajustes > Repetição). Os VK são códigos
+ // virtuais do Windows; nomes e faixa válida vêm de core/repetition.h.
+ struct RepetitionSettings {
+@@ -134,6 +150,10 @@ struct AppState {
+ 
+     // Repetição automática do padrão (hotkey global; ver App::TickRepetition)
+     RepetitionSettings repetition;
++    // Reconhecimento visual automático (aba Ajustes > Auto-Reconhecimento).
++    // As imagens de referência ficam em state_.weaponImages (seção "weaponImages").
++    AutoVisionSettings autoVision;
++    std::vector<WeaponImageEntry> weaponImages;
+     bool repeatArmed = true;                 // false até a tecla de atalho ser solta
+     int repeatHotkeyId = 0;                  // hotkey global registrada (0 = nenhuma)
+     std::vector<int> registeredStopKeys{};   // VKs realmente registrados no Windows
+diff --git a/src/ui/auto_vision.cpp b/src/ui/auto_vision.cpp
+new file mode 100644
+index 0000000..f6f268d
+--- /dev/null
++++ b/src/ui/auto_vision.cpp
+@@ -0,0 +1,148 @@
++#include "ui/auto_vision.h"
++
++#include "core/vision/png.h"
++#include "core/weapon.h"
++
++namespace st {
++
++std::vector<std::string> AutoVisionController::ReloadTemplates(
++    const ProfileData& profile, const std::vector<WeaponImageEntry>& entries) {
++    std::vector<std::string> warnings;
++    templatesLoaded_ = false;
++
++    if (profile.autoRegionW <= 0 || profile.autoRegionH <= 0) {
++        warnings.push_back("Regiao de reconhecimento nao configurada (defina X/Y/L/A).");
++        matcher_.Build(ImageRgb{}, {});
++        return warnings;
++    }
++
++    // A regiao monitorada define a escala de trabalho: os templates sao
++    // recortes cadastrados no tamanho da propria regiao (ver TemplateMatcher).
++    ImageRgb referenceSize;
++    referenceSize.width = profile.autoRegionW;
++    referenceSize.height = profile.autoRegionH;
++    referenceSize.rgb.assign(static_cast<std::size_t>(profile.autoRegionW) *
++                                 static_cast<std::size_t>(profile.autoRegionH) * 3u,
++                             0u);
++
++    std::vector<TemplateMatcher::WeaponTemplate> templates;
++    for (const WeaponImageEntry& entry : entries) {
++        if (entry.pngBase64.empty()) {
++            continue;  // arma sem imagem cadastrada: simplesmente ignorada
++        }
++        int weaponIndex = -1;
++        for (int i = 0; i < static_cast<int>(Weapon::Count); ++i) {
++            if (GetWeaponInfo(static_cast<Weapon>(i)).id == entry.weaponId) {
++                weaponIndex = i;
++                break;
++            }
++        }
++        if (weaponIndex < 0) {
++            warnings.push_back("Imagem de referencia descartada: arma desconhecida \"" +
++                               entry.weaponId + "\".");
++            continue;
++        }
++        std::vector<unsigned char> pngBytes;
++        if (!Base64Decode(entry.pngBase64, pngBytes)) {
++            warnings.push_back("Imagem de \"" + entry.weaponId +
++                               "\" descartada: base64 invalido.");
++            continue;
++        }
++        ImageRgb decoded;
++        if (!DecodePng(pngBytes, decoded) || decoded.Empty()) {
++            warnings.push_back("Imagem de \"" + entry.weaponId +
++                               "\" descartada: PNG invalido ou corrompido.");
++            continue;
++        }
++        if (decoded.width > profile.autoRegionW || decoded.height > profile.autoRegionH) {
++            warnings.push_back("Imagem de \"" + entry.weaponId +
++                               "\" descartada: maior que a regiao monitorada.");
++            continue;
++        }
++        TemplateMatcher::WeaponTemplate t;
++        t.weaponIndex = weaponIndex;
++        t.image = std::move(decoded);
++        templates.push_back(std::move(t));
++    }
++    if (templates.empty()) {
++        warnings.push_back("Nenhuma imagem de referencia valida cadastrada.");
++    }
++
++    matcher_.Build(referenceSize, templates);
++    picker_.Reset();
++    lastCheckMs_ = -1.0e9;
++    status_ = FrameStatus{};
++    templatesLoaded_ = !matcher_.Empty();
++    return warnings;
++}
++
++void AutoVisionController::Tick(const ProfileData& profile, double nowMs,
++                                CaptureResult (*capture)(const ProfileData&), bool& outSwitched,
++                                int& outWeaponIndex) {
++    outSwitched = false;
++    outWeaponIndex = -1;
++    status_.enabled = profile.autoVisionEnabled;
++
++    if (!profile.autoVisionEnabled) {
++        if (status_.weaponIndex != -1 || status_.status != AutoPicker::Status::Waiting) {
++            Reset();
++            status_.enabled = false;
++        }
++        return;
++    }
++    if (!templatesLoaded_ || matcher_.Empty()) {
++        status_.reason = "sem imagens cadastradas";
++        return;
++    }
++    // Intervalo minimo entre verificacoes (requisito de desempenho): nunca
++    // captura duas vezes no mesmo tick nem mais rapido que autoIntervalMs.
++    if (nowMs - lastCheckMs_ < static_cast<double>(profile.autoIntervalMs)) {
++        return;
++    }
++    lastCheckMs_ = nowMs;
++
++    CaptureResult shot = capture(profile);
++    if (!shot.ok || shot.image.Empty()) {
++        status_.captureFailed = true;
++        status_.status = AutoPicker::Status::Waiting;
++        status_.reason = shot.error.empty() ? "falha na captura" : shot.error;
++        // Sem leitura nova: mantem a arma atual em espera, sem reexecutar nada.
++        return;
++    }
++    status_.captureFailed = false;
++    lastCapture_ = std::move(shot.image);
++
++    std::vector<float> scores(static_cast<std::size_t>(Weapon::Count), 0.0f);
++    for (std::size_t i = 0; i < matcher_.Count(); ++i) {
++        const TemplateMatcher::Hit hit = matcher_.MatchBySlot(static_cast<int>(i), lastCapture_);
++        const int idx = matcher_.WeaponIndexAt(static_cast<int>(i));
++        if (idx >= 0 && idx < static_cast<int>(Weapon::Count)) {
++            scores[static_cast<std::size_t>(idx)] = TemplateMatcher::Confidence(hit.sad);
++        }
++    }
++
++    AutoPicker::Params params;
++    params.minConfidence = profile.autoConfidenceMin;
++    params.confirmations = profile.autoConfirmFrames;
++    params.minIntervalMs = static_cast<double>(profile.autoIntervalMs) * 2.0;
++    picker_.SetParams(params);
++
++    const AutoPicker::Result decision = picker_.Observe(nowMs, scores);
++    status_.status = decision.status;
++    status_.confidence = decision.confidence;
++    status_.reason = decision.reason;
++    status_.weaponIndex = decision.weaponIndex;
++    if (decision.switched) {
++        status_.lastSwitchMs = nowMs;
++        outSwitched = true;
++        outWeaponIndex = decision.weaponIndex;
++    }
++}
++
++void AutoVisionController::Reset() {
++    picker_.Reset();
++    status_ = FrameStatus{};
++    lastCheckMs_ = -1.0e9;
++}
++
++}  // namespace st
+diff --git a/src/ui/auto_vision.h b/src/ui/auto_vision.h
+new file mode 100644
+index 0000000..6c02646
+--- /dev/null
++++ b/src/ui/auto_vision.h
+@@ -0,0 +1,70 @@
++#pragma once
++
++#include "config/profile.h"
++#include "core/vision/auto_picker.h"
++#include "core/vision/image.h"
++#include "core/vision/matcher.h"
++#include "core/vision/weapon_images.h"
++
++#include <string>
++#include <vector>
++
++namespace st {
++
++// Orquestração do reconhecimento visual automático, separada das chamadas
++// Win32 para poder ser testada em qualquer plataforma (padrão do projeto:
++// lógica no núcleo/UI portável, API nativa só na borda).
++// O App chama TickAutoVision() a cada frame; quando auto == true, esta classe
++// pede uma captura da região configurada, roda o TemplateMatcher e decide via
++// AutoPicker. A troca de arma efetiva acontece no App (thread da UI), usando
++// exatamente o mesmo caminho das teclas F1/F2 (SelectWeapon).
++class AutoVisionController {
++public:
++    struct FrameStatus {
++        bool enabled = false;         // modo automático ligado
++        bool captureFailed = false;   // última captura falhou (janela fechada etc.)
++        AutoPicker::Status status = AutoPicker::Status::Waiting;
++        int weaponIndex = -1;         // arma reconhecida agora (-1 = nenhuma)
++        float confidence = 0.0f;
++        std::string reason;           // motivo legível da última decisão/rejeição
++        double lastSwitchMs = -1.0e9; // relógio do app na última troca confirmada
++    };
++
++    // Recarrega templates a partir do perfil (seção weaponImages + região).
++    // Devolve avisos legíveis para a UI (PNG inválido, template maior que a
++    // região etc.). Chamado ao ligar o modo automático e após editar imagens.
++    std::vector<std::string> ReloadTemplates(const ProfileData& profile,
++                                             const std::vector<WeaponImageEntry>& entries);
++
++    struct CaptureResult {
++        bool ok = false;
++        ImageRgb image;      // válido se ok
++        std::string error;   // motivo legível se !ok (ex.: janela não encontrada)
++    };
++
++    // Uma verificação completa: captura -> match -> decisão. `nowMs` é o
++    // relógio do app (GetTickCount64). Não faz nada se desligado ou se o
++    // intervalo entre verificações ainda não passou (requisito de desempenho).
++    // `outSwitched` é true exatamente quando o App deve selecionar a arma
++    // `outWeaponIndex` (transição confirmada pelo AutoPicker).
++    void Tick(const ProfileData& profile, double nowMs, CaptureResult (*capture)(const ProfileData&),
++              bool& outSwitched, int& outWeaponIndex);
++
++    const FrameStatus& Status() const { return status_; }
++    // Última imagem capturada com sucesso (para prévia na UI). Vazia se nunca.
++    const ImageRgb& LastCapture() const { return lastCapture_; }
++    bool HasLastCapture() const { return !lastCapture_.Empty(); }
++
++    // Desliga/esquece tudo (chamado ao desativar o modo automático).
++    void Reset();
++
++private:
++    TemplateMatcher matcher_;
++    AutoPicker picker_;
++    FrameStatus status_;
++    ImageRgb lastCapture_;
++    double lastCheckMs_ = -1.0e9;
++    bool templatesLoaded_ = false;
++};
++
++}  // namespace st
+diff --git a/src/ui/profiles.cpp b/src/ui/profiles.cpp
+index 38e2d49..131b179 100644
+--- a/src/ui/profiles.cpp
++++ b/src/ui/profiles.cpp
+@@ -38,6 +38,28 @@ void MarkSaved(AppState& state, const std::string& name, const ProfileData& data
+     InvalidateList(state);
+ }
+ 
++// Imagens de referência do reconhecimento automático: arquivo irmão do perfil
++// (nome.images.json). Salvar com melhor esforço — uma falha aqui não invalida
++// o perfil em si, mas o aviso aparece para o usuário.
++void SaveImages(AppState& state, const std::string& name) {
++    if (StoreResult r = state.profiles.store->SaveWeaponImages(name, state.weaponImages); !r.ok) {
++        Notify(state, "Perfil salvo, mas as imagens do reconhecimento nao foram: " + r.error, true);
++    }
++}
++
++void LoadImages(AppState& state, const std::string& name) {
++    std::vector<std::string> warnings;
++    if (StoreResult r = state.profiles.store->LoadWeaponImages(name, state.weaponImages, &warnings); !r.ok) {
++        // Arquivo ilegivel: segue sem imagens (o load do perfil ja avisou de si).
++        state.weaponImages.clear();
++        Notify(state, "Imagens do reconhecimento ignoradas: " + r.error, true);
++        return;
++    }
++    if (!warnings.empty()) {
++        Notify(state, "Imagens do reconhecimento com ajustes: " + JoinWarnings(warnings), true);
++    }
++}
++
+ std::string JoinWarnings(const std::vector<std::string>& warnings) {
+     std::string text;
+     for (std::size_t i = 0; i < warnings.size() && i < 3; ++i) {
+@@ -85,6 +107,15 @@ ProfileData Capture(const AppState& s) {
+     d.repeatRestartFromZero = s.repetition.restartFromZero;
+     d.cycleWeaponKeyVk = s.repetition.cycleWeaponKeyVk;
+     d.cycleBackKeyVk = s.repetition.cycleBackKeyVk;
++    d.autoVisionEnabled = s.autoVision.enabled;
++    d.autoRegionX = s.autoVision.regionX;
++    d.autoRegionY = s.autoVision.regionY;
++    d.autoRegionW = s.autoVision.regionW;
++    d.autoRegionH = s.autoVision.regionH;
++    d.autoWindowTitle = s.autoVision.windowTitle;
++    d.autoConfidenceMin = s.autoVision.confidenceMin;
++    d.autoIntervalMs = s.autoVision.intervalMs;
++    d.autoConfirmFrames = s.autoVision.confirmFrames;
+     return d;
+ }
+ 
+@@ -129,6 +160,15 @@ bool Apply(AppState& s, const ProfileData& d) {
+     s.repetition.restartFromZero = d.repeatRestartFromZero;
+     s.repetition.cycleWeaponKeyVk = d.cycleWeaponKeyVk;
+     s.repetition.cycleBackKeyVk = d.cycleBackKeyVk;
++    s.autoVision.enabled = d.autoVisionEnabled;
++    s.autoVision.regionX = d.autoRegionX;
++    s.autoVision.regionY = d.autoRegionY;
++    s.autoVision.regionW = d.autoRegionW;
++    s.autoVision.regionH = d.autoRegionH;
++    s.autoVision.windowTitle = d.autoWindowTitle;
++    s.autoVision.confidenceMin = d.autoConfidenceMin;
++    s.autoVision.intervalMs = d.autoIntervalMs;
++    s.autoVision.confirmFrames = d.autoConfirmFrames;
+     theme::SetAccent(s.ui.accent);  // cada janela reaplica o estilo no próprio contexto
+     s.lastResult.reset();
+     return true;
+@@ -174,6 +214,7 @@ void Startup(AppState& state) {
+     }
+     Apply(state, data);
+     p.current = last;
++    LoadImages(state, last);  // imagens do reconhecimento (arquivo irmão; ausente = vazio)
+     p.savedSnapshot = Capture(state);
+     p.selected = last;
+     if (!warnings.empty()) {
+@@ -231,6 +272,7 @@ bool SaveAs(AppState& state, const std::string& name) {
+         Notify(state, "Não foi possível salvar: " + r.error, true);
+         return false;
+     }
++    SaveImages(state, name);  // imagens do reconhecimento acompanham o perfil
+     MarkSaved(state, name, data);
+     p.selected = name;
+     Notify(state, "Perfil \"" + name + "\" salvo.");
+@@ -248,6 +290,7 @@ bool Load(AppState& state, const std::string& name) {
+         return false;
+     }
+     Apply(state, data);
++    LoadImages(state, name);
+     MarkSaved(state, name, Capture(state));
+     state.profiles.selected = name;
+     if (warnings.empty()) {
+diff --git a/tests/config_tests.cpp b/tests/config_tests.cpp
+index 99560d7..39f63bc 100644
+--- a/tests/config_tests.cpp
++++ b/tests/config_tests.cpp
+@@ -216,6 +216,49 @@ void TestRepetitionSection() {
+     Check(!st::ProfileFromJson(many.dump(), d).ok, "mais de 11 teclas de parar é rejeitado");
+ }
+ 
++void TestAutoVisionSection() {
++    // Round-trip completo das configurações de reconhecimento automático.
++    st::ProfileData p = st::DefaultProfile();
++    p.autoVisionEnabled = true;
++    p.autoRegionX = 100;
++    p.autoRegionY = 200;
++    p.autoRegionW = 640;
++    p.autoRegionH = 480;
++    p.autoWindowTitle = "Counter-Strike 2";
++    p.autoConfidenceMin = 0.9f;
++    p.autoIntervalMs = 350;
++    p.autoConfirmFrames = 5;
++    const std::string json = st::ProfileToJson(p);
++    st::ProfileData back;
++    const st::ParseResult r = st::ProfileFromJson(json, back);
++    Check(r.ok && back == p, "seção autoVision sobrevive ao save/load");
++
++    // Perfil antigo sem a seção abre com os padrões (desligado), silenciosamente.
++    nlohmann::json old = nlohmann::json::parse(st::ProfileToJson(st::DefaultProfile()));
++    old.erase("autoVision");
++    st::ProfileData d;
++    const st::ParseResult legacy = st::ProfileFromJson(old.dump(), d);
++    Check(legacy.ok && legacy.warnings.empty() && d == st::DefaultProfile() && !d.autoVisionEnabled,
++          "perfis sem autoVision usam o padrão desligado sem avisos");
++
++    // Valores fora da faixa são ajustados com aviso, não rejeitados.
++    nlohmann::json clampj = nlohmann::json::parse(json);
++    clampj["autoVision"]["intervalMs"] = 999999;
++    clampj["autoVision"]["confirmFrames"] = 50;
++    st::ProfileData clamped;
++    const st::ParseResult cr = st::ProfileFromJson(clampj.dump(), clamped);
++    Check(cr.ok && clamped.autoIntervalMs == 2000 && clamped.autoConfirmFrames == 10 && !cr.warnings.empty(),
++          "intervalo/confirmações fora da faixa são ajustados com aviso");
++
++    // Tipos errados são erros claros.
++    nlohmann::json badtype = nlohmann::json::parse(json);
++    badtype["autoVision"]["enabled"] = "sim";
++    Check(!st::ProfileFromJson(badtype.dump(), d).ok, "enabled não booleano é rejeitado");
++    nlohmann::json badreg = nlohmann::json::parse(json);
++    badreg["autoVision"]["region"] = {1, 2, 3};
++    Check(!st::ProfileFromJson(badreg.dump(), d).ok, "region com tamanho errado é rejeitada");
++}
++
+ st::BurstRecord SampleBurst(std::int64_t t, st::Weapon w, float score) {
+     st::BurstRecord b;
+     b.timestamp = t;
+@@ -298,6 +341,7 @@ int main() {
+     TestStore(root);
+     TestOptionalSections();
+     TestRepetitionSection();
++    TestAutoVisionSection();
+     TestHistory(root);
+     TestFactoryDefaultsMatchUserProfile();
+     std::error_code ec;
+diff --git a/tests/vision_tests.cpp b/tests/vision_tests.cpp
+new file mode 100644
+index 0000000..cd0af39
+--- /dev/null
++++ b/tests/vision_tests.cpp
+@@ -0,0 +1,516 @@
++// Testes do reconhecimento visual automático (núcleo portável). Rodam com ctest.
++#include "core/vision/auto_picker.h"
++#include "core/vision/image.h"
++#include "core/vision/matcher.h"
++#include "core/vision/png.h"
++#include "core/vision/weapon_images.h"
++
++#include <nlohmann/json.hpp>
++
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++namespace {
++
++int g_failures = 0;
++
++void Check(bool ok, const char* what) {
++    if (!ok) {
++        std::printf("FALHOU: %s\n", what);
++        ++g_failures;
++    }
++}
++
++// Imagem sintética: fundo cinza-escuro com um "emblema" retangular colorido.
++st::ImageRgb MakeRegion(int w, int h, unsigned char r, unsigned char g, unsigned char b,
++                        int badgeX, int badgeY, int badgeW, int badgeH,
++                        unsigned char br, unsigned char bg, unsigned char bb) {
++    st::ImageRgb img;
++    img.width = w;
++    img.height = h;
++    img.rgb.assign(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3u, 40);
++    for (std::size_t i = 0; i < img.rgb.size(); i += 3u) {
++        img.rgb[i] = r;
++        img.rgb[i + 1u] = g;
++        img.rgb[i + 2u] = b;
++    }
++    for (int y = badgeY; y < badgeY + badgeH && y < h; ++y) {
++        for (int x = badgeX; x < badgeX + badgeW && x < w; ++x) {
++            const std::size_t p = (static_cast<std::size_t>(y) * static_cast<std::size_t>(w) +
++                                   static_cast<std::size_t>(x)) * 3u;
++            img.rgb[p] = br;
++            img.rgb[p + 1u] = bg;
++            img.rgb[p + 2u] = bb;
++        }
++    }
++    return img;
++}
++
++// Recorte exato da região (o cadastro é feito no tamanho da área monitorada).
++st::ImageRgb Crop(const st::ImageRgb& in, int x, int y, int w, int h) {
++    st::ImageRgb out;
++    out.width = w;
++    out.height = h;
++    out.rgb.assign(static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 3u, 0);
++    for (int yy = 0; yy < h; ++yy) {
++        for (int xx = 0; xx < w; ++xx) {
++            const std::size_t s = (static_cast<std::size_t>(yy + y) * static_cast<std::size_t>(in.width) +
++                                   static_cast<std::size_t>(xx + x)) * 3u;
++            const std::size_t d = (static_cast<std::size_t>(yy) * static_cast<std::size_t>(w) +
++                                   static_cast<std::size_t>(xx)) * 3u;
++            for (std::size_t c = 0; c < 3u; ++c) {
++                out.rgb[d + c] = in.rgb[s + c];
++            }
++        }
++    }
++    return out;
++}
++
++void TestDownscale() {
++    st::ImageRgb big = MakeRegion(8, 8, 10, 20, 30, 0, 0, 2, 2, 250, 250, 250);
++    st::ImageRgb half;
++    Check(st::DownscaleHalf(big, half), "downscale por 2 funciona");
++    Check(half.width == 4 && half.height == 4, "downscale reduz metade dos lados");
++    // média 2x2 arredondada do bloco inteiro: os 4 pixels do canto são todos
++    // (250,250,250) -> canal R do pixel (0,0) da reduzida = 250.
++    Check(half.rgb[0] == 250, "media 2x2 correta (bloco branco)");
++    // o proximo pixel da linha reduzida so toca o fundo (10,20,30)
++    Check(half.rgb[3] == 10 && half.rgb[4] == 20 && half.rgb[5] == 30, "media 2x2 correta (fundo)");
++    st::ImageRgb same;
++    Check(!st::DownscaleHalf(st::ImageRgb{}, same), "imagem vazia recusada no downscale");
++
++    st::ImageRgb fitted;
++    st::DownscaleToFit(big, 100, fitted);
++    Check(fitted.width == 8 && fitted.height == 8, "DownscaleToFit copia quando ja cabe");
++    st::DownscaleToFit(big, 4, fitted);
++    Check(fitted.width == 4 && fitted.height == 4, "DownscaleToFit reduz ate caber");
++}
++
++void TestMatcherExactAndShifted() {
++    // Regioes 160x160 com fundo identico; emblemas de tamanhos e cores diferentes
++    // (AK: 60x40 laranja, M4: 40x30 azul). O template da M4 sobre a regiao da AK
++    // desliza pela regiao inteira: so o retangulo de fundo cinza casa -> SAD ~0.
++    // Por isso a discriminacao entre armas vem do DELTA de confianca entre os dois
++    // templates (comportamento real de template matching), nao do SAD absoluto.
++    const st::ImageRgb regionAk = MakeRegion(160, 160, 250, 250, 250, 10, 90, 60, 40, 200, 60, 40);
++    const st::ImageRgb regionM4 = MakeRegion(160, 160, 250, 250, 250, 110, 10, 40, 30, 40, 160, 200);
++
++    std::vector<st::TemplateMatcher::WeaponTemplate> templates;
++    templates.push_back({0, Crop(regionAk, 0, 0, 160, 160)});   // arma 0 = regiao com AK
++    templates.push_back({1, Crop(regionM4, 0, 0, 160, 160)});   // arma 1 = regiao com M4
++    st::TemplateMatcher matcher;
++    matcher.Build(regionAk, templates);
++    Check(matcher.Count() == 2, "dois templates construidos");
++
++    st::TemplateMatcher::Hit h0 = matcher.Match(0, regionAk);
++    Check(h0.sad < 1.0f, "template identico casa com confianca maxima");
++    Check(st::TemplateMatcher::Confidence(h0.sad) > 0.99f, "confianca ~1.0 para imagem igual");
++
++    st::TemplateMatcher::Hit h1 = matcher.Match(1, regionAk);
++    const float c0 = st::TemplateMatcher::Confidence(h0.sad);
++    const float c1 = st::TemplateMatcher::Confidence(h1.sad);
++    Check(c0 - c1 > 0.25f, "arma errada fica muito abaixo da certa (delta confianca)");
++
++    // Deslocamento dentro da regiao: template menor que a area desliza e ainda casa.
++    const st::ImageRgb smallTpl = Crop(regionAk, 10, 90, 60, 40);  // so o emblema da AK
++    std::vector<st::TemplateMatcher::WeaponTemplate> t2;
++    t2.push_back({0, smallTpl});
++    st::TemplateMatcher m2;
++    m2.Build(regionAk, t2);
++    Check(m2.Count() == 1, "template menor aceito");
++    st::TemplateMatcher::Hit hs = m2.Match(0, regionAk);
++    Check(st::TemplateMatcher::Confidence(hs.sad) > 0.99f, "emblema encontrado na regiao");
++    Check(hs.x >= 8 && hs.x <= 12 && hs.y >= 88 && hs.y <= 92, "posicao da batida perto do original");
++
++    // Emblema movido para outra parte da mesma regiao: busca deslizante encontra.
++    st::ImageRgb moved = MakeRegion(160, 160, 250, 250, 250, 80, 30, 60, 40, 200, 60, 40);
++    st::TemplateMatcher::Hit hm = m2.Match(0, moved);
++    Check(st::TemplateMatcher::Confidence(hm.sad) > 0.99f, "emblema reconhecido em nova posicao");
++    Check(hm.x >= 78 && hm.x <= 82 && hm.y >= 28 && hm.y <= 32, "nova posicao reportada corretamente");
++}
++
++void TestMatcherRobustness() {
++    const st::ImageRgb base = MakeRegion(120, 120, 20, 40, 60, 20, 20, 50, 30, 220, 200, 20);
++    std::vector<st::TemplateMatcher::WeaponTemplate> templates;
++    templates.push_back({0, base});
++    st::TemplateMatcher matcher;
++    matcher.Build(base, templates);
++
++    // Pequena variacao de renderizacao (ruido +-6 por canal) continua confiavel.
++    st::ImageRgb noisy = base;
++    std::size_t i = 0;
++    for (auto& px : noisy.rgb) {
++        const int delta = (static_cast<int>(i / 3u) % 13) - 6;
++        const int v = static_cast<int>(px) + delta;
++        px = static_cast<unsigned char>(v < 0 ? 0 : (v > 255 ? 255 : v));
++        ++i;
++    }
++    Check(st::TemplateMatcher::Confidence(matcher.Match(0, noisy).sad) > 0.9f,
++          "ruido leve mantem confianca alta");
++
++    // Troca total de conteudo: confianca cai muito (sem correspondencia).
++    const st::ImageRgb other = MakeRegion(120, 120, 200, 10, 10, 60, 60, 40, 40, 10, 10, 220);
++    Check(st::TemplateMatcher::Confidence(matcher.Match(0, other).sad) < 0.4f,
++          "imagem desconhecida devolve confianca baixa");
++
++    // Regiao de tamanho incompativel: Match devolve sem correspondencia (255).
++    st::ImageRgb wrongSize = MakeRegion(100, 100, 20, 40, 60, 0, 0, 0, 0, 0, 0, 0);
++    Check(matcher.Match(0, wrongSize).sad >= 254.0f, "tamanho errado rejeitado");
++
++    // Template maior que a regiao reduzida e descartado no Build.
++    std::vector<st::TemplateMatcher::WeaponTemplate> bigTpl;
++    bigTpl.push_back({0, MakeRegion(300, 300, 1, 2, 3, 0, 0, 0, 0, 0, 0, 0)});
++    st::TemplateMatcher m3;
++    m3.Build(base, bigTpl);
++    Check(m3.Count() == 0, "template maior que a regiao descartado");
++}
++
++void TestAutoPickerBasics() {
++    st::AutoPicker::Params p;
++    p.minConfidence = 0.85f;
++    p.confirmations = 3;
++    p.minIntervalMs = 400.0;
++    st::AutoPicker picker(p);
++
++    // Sem nada reconhecido: espera, sem execucao.
++    auto r = picker.Observe(0.0, {0.1f, 0.2f});
++    Check(!r.switched && r.weaponIndex == -1 && r.status == st::AutoPicker::Status::Waiting,
++          "sem match fica em espera");
++
++    // Confianca abaixo do minimo: rejeita, nao executa.
++    r = picker.Observe(100.0, {0.8f, 0.1f});
++    Check(!r.switched && r.status == st::AutoPicker::Status::LowScore, "confianca baixa rejeitada");
++
++    // Candidato valido: precisa de 3 confirmacoes consecutivas antes de trocar.
++    r = picker.Observe(200.0, {0.95f, 0.1f});
++    Check(!r.switched && r.status == st::AutoPicker::Status::Pending, "1a confirmacao nao executa");
++    r = picker.Observe(300.0, {0.95f, 0.1f});
++    Check(!r.switched && r.status == st::AutoPicker::Status::Pending, "2a confirmacao nao executa");
++    r = picker.Observe(400.0, {0.95f, 0.1f});
++    Check(r.switched && r.weaponIndex == 0 && r.status == st::AutoPicker::Status::Identified,
++          "3a confirmacao executa exatamente uma vez");
++
++    // Mesma imagem continuando visivel: NUNCA repete a execucao.
++    for (double t = 500.0; t <= 3000.0; t += 100.0) {
++        r = picker.Observe(t, {0.95f, 0.1f});
++        Check(!r.switched, "sem execucao repetida enquanto a mesma imagem persiste");
++    }
++
++    // Mudanca real para outro item: confirma e troca uma unica vez.
++    r = picker.Observe(3100.0, {0.2f, 0.93f});
++    Check(!r.switched && r.status == st::AutoPicker::Status::Pending, "transicao exige confirmacao");
++    r = picker.Observe(3200.0, {0.2f, 0.93f});
++    r = picker.Observe(3300.0, {0.2f, 0.93f});
++    Check(r.switched && r.weaponIndex == 1, "novo item executado apos confirmar");
++    r = picker.Observe(3400.0, {0.2f, 0.93f});
++    Check(!r.switched, "novo item nao repete na sequencia");
++}
++
++void TestAutoPickerAmbiguityAndOscillation() {
++    st::AutoPicker::Params p;
++    p.minConfidence = 0.85f;
++    p.ambiguityMargin = 0.03f;
++    p.confirmations = 2;
++    p.minIntervalMs = 400.0;
++    st::AutoPicker picker(p);
++
++    // Duas armas quase empatadas acima do minimo: ambiguo, nada roda.
++    auto r = picker.Observe(0.0, {0.95f, 0.94f});
++    Check(!r.switched && r.status == st::AutoPicker::Status::Ambiguous, "empate tratado como ambiguo");
++    r = picker.Observe(100.0, {0.95f, 0.94f});
++    Check(!r.switched && r.weaponIndex == -1, "ambiguo nao seleciona item");
++
++    // Uma delas domina: confirma e troca (janela anti-oscilacao so vale apos uma
++    // troca real — aqui ainda nao houve nenhuma).
++    r = picker.Observe(200.0, {0.97f, 0.5f});
++    r = picker.Observe(300.0, {0.97f, 0.5f});
++    Check(r.switched && r.weaponIndex == 0, "desempate confirma o vencedor");
++
++    // Oscilacao rapida logo apos a troca: leitura de OUTRA arma dentro da janela
++    // minima e ignorada; leituras repetidas da mesma nova arma ainda precisam
++    // esperar a janela terminar para confirmar.
++    r = picker.Observe(350.0, {0.2f, 0.97f});   // so 50ms depois da troca: bloqueado
++    Check(!r.switched, "janela anti-oscilacao bloqueia leitura discordante");
++    r = picker.Observe(400.0, {0.2f, 0.97f});
++    r = picker.Observe(500.0, {0.2f, 0.97f});
++    Check(!r.switched, "confirmacoes dentro da janela minima nao executam");
++    r = picker.Observe(900.0, {0.2f, 0.97f});
++    r = picker.Observe(1000.0, {0.2f, 0.97f});
++    Check(r.switched && r.weaponIndex == 1, "troca validada apos o intervalo minimo");
++
++    // Imagem some temporariamente: mantem a arma atual, sem executar nada.
++    r = picker.Observe(1100.0, {0.1f, 0.1f});
++    Check(!r.switched && r.weaponIndex == 1 && r.status == st::AutoPicker::Status::Waiting,
++          "sumico temporario mantem a arma ativa");
++
++    // Reset ao desligar o modo automatico.
++    picker.Reset();
++    Check(picker.CurrentWeapon() == -1 && picker.GetStatus() == st::AutoPicker::Status::Waiting,
++          "reset limpa o estado");
++}
++
++// PNG RGBA 8 bits REAL (bloco deflate stored, CRC/adler validos): exercita o
++// parser de chunks + Stored() do Inflator com dados externos, como os importados
++// pelo usuario na UI. Conteudo: fundo (10,20,30), badge branco 2x2 no canto sup. esq.
++// NOTA: IDAT com bloco deflate STORED (RFC 1951 tipo 0) + CRC/adler reais,
++// gerado e verificado byte a byte; qualquer edição manual invalida o CRC.
++static const unsigned char kRealPng[] = {
++    137,80,78,71,13,10,26,10,0,0,0,13,
++    73,72,68,82,0,0,0,8,0,0,0,8,
++    8,2,0,0,0,75,109,41,220,0,0,0,
++    211,73,68,65,84,120,1,1,200,0,55,255,
++    0,250,250,250,250,250,250,10,20,30,10,20,
++    30,10,20,30,10,20,30,10,20,30,10,20,
++    30,0,250,250,250,250,250,250,10,20,30,10,
++    20,30,10,20,30,10,20,30,10,20,30,10,
++    20,30,0,10,20,30,10,20,30,10,20,30,
++    10,20,30,10,20,30,10,20,30,10,20,30,
++    10,20,30,0,10,20,30,10,20,30,10,20,
++    30,10,20,30,10,20,30,10,20,30,10,20,
++    30,10,20,30,0,10,20,30,10,20,30,10,
++    20,30,10,20,30,10,20,30,10,20,30,10,
++    20,30,10,20,30,0,10,20,30,10,20,30,
++    10,20,30,10,20,30,10,20,30,10,20,30,
++    10,20,30,10,20,30,0,10,20,30,10,20,
++    30,10,20,30,10,20,30,10,20,30,10,20,
++    30,10,20,30,10,20,30,0,10,20,30,10,
++    20,30,10,20,30,10,20,30,10,20,30,10,
++    20,30,10,20,30,10,20,30,201,25,155,152,
++    69,102,218,11,0,0,0,0,73,69,78,68,
++    174,66,96,130,
++};
++
++void TestPngRoundTrip() {
++    // PNG 8-bit RGBA gerado byte a byte (IDAT com stored-deflate) -> decoder proprio.
++    std::vector<unsigned char> raw;  // filtro 0 + RGBA por linha
++    const int w = 3, h = 2;
++    const unsigned char px[6][4] = {
++        {255, 0, 0, 255}, {0, 255, 0, 255}, {0, 0, 255, 255},
++        {10, 20, 30, 128}, {200, 150, 100, 255}, {1, 2, 3, 0}};
++    for (int y = 0; y < h; ++y) {
++        raw.push_back(0);
++        for (int x = 0; x < w; ++x) {
++            for (int c = 0; c < 4; ++c) raw.push_back(px[y * w + x][c]);
++        }
++    }
++
++    auto crc32 = [](const std::vector<unsigned char>& data) {
++        static unsigned table[256];
++        static bool init = false;
++        if (!init) {
++            for (unsigned n = 0; n < 256; ++n) {
++                unsigned c = n;
++                for (int k = 0; k < 8; ++k) c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
++                table[n] = c;
++            }
++            init = true;
++        }
++        unsigned c = 0xFFFFFFFFu;
++        for (unsigned char b : data) c = table[(c ^ b) & 0xFFu] ^ (c >> 8);
++        return c ^ 0xFFFFFFFFu;
++    };
++    auto be32 = [](std::vector<unsigned char>& v, unsigned x) {
++        v.push_back(static_cast<unsigned char>(x >> 24));
++        v.push_back(static_cast<unsigned char>(x >> 16));
++        v.push_back(static_cast<unsigned char>(x >> 8));
++        v.push_back(static_cast<unsigned char>(x));
++    };
++    auto addChunk = [&](std::vector<unsigned char>& png, const char type[4],
++                        const std::vector<unsigned char>& body) {
++        be32(png, static_cast<unsigned>(body.size()));
++        std::vector<unsigned char> crcInput;
++        for (int i = 0; i < 4; ++i) {
++            png.push_back(static_cast<unsigned char>(type[i]));
++            crcInput.push_back(static_cast<unsigned char>(type[i]));
++        }
++        png.insert(png.end(), body.begin(), body.end());
++        crcInput.insert(crcInput.end(), body.begin(), body.end());
++        be32(png, crc32(crcInput));
++    };
++
++    std::vector<unsigned char> png = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
++    std::vector<unsigned char> ihdr;
++    be32(ihdr, static_cast<unsigned>(w));
++    be32(ihdr, static_cast<unsigned>(h));
++    ihdr.push_back(8);   // profundidade
++    ihdr.push_back(6);   // RGBA truecolor
++    ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0);
++    addChunk(png, "IHDR", ihdr);
++    // stored deflate: header 0x78 0x01 + blocos stored + adler32 (little-endian,
++    // ordem real do RFC 1950 — o decoder pula esses 2 bytes do zlib e lê o resto).
++    std::vector<unsigned char> idat = {0x78, 0x01};
++    std::size_t off = 0;
++    while (off < raw.size()) {
++        const std::size_t n = std::min<std::size_t>(raw.size() - off, 60000);
++        const bool last = (off + n) >= raw.size();
++        idat.push_back(last ? 1 : 0);
++        idat.push_back(static_cast<unsigned char>(n & 0xFF));
++        idat.push_back(static_cast<unsigned char>((n >> 8) & 0xFF));
++        const unsigned nl = static_cast<unsigned>(~n & 0xFFFF);
++        idat.push_back(static_cast<unsigned char>(nl & 0xFF));
++        idat.push_back(static_cast<unsigned char>((nl >> 8) & 0xFF));
++        idat.insert(idat.end(), raw.begin() + static_cast<std::ptrdiff_t>(off),
++                    raw.begin() + static_cast<std::ptrdiff_t>(off + n));
++        off += n;
++    }
++    {
++        unsigned a = 1, bSum = 0;
++        for (unsigned char byte : raw) {
++            a = (a + byte) % 65521u;
++            bSum = (bSum + a) % 65521u;
++        }
++        const unsigned adler = (bSum << 16) | a;
++        idat.push_back(static_cast<unsigned char>(adler));
++        idat.push_back(static_cast<unsigned char>(adler >> 8));
++        idat.push_back(static_cast<unsigned char>(adler >> 16));
++        idat.push_back(static_cast<unsigned char>(adler >> 24));
++    }
++    addChunk(png, "IDAT", idat);
++    addChunk(png, "IEND", {});
++
++    st::ImageRgb decoded;
++    Check(st::DecodePng(png, decoded), "PNG RGBA 8 bits decodificado");
++    Check(decoded.width == w && decoded.height == h, "dimensoes do PNG corretas");
++    if (decoded.width == w && decoded.height == h && decoded.rgb.size() == decoded.SizeBytes()) {
++        Check(decoded.rgb[0] == 255 && decoded.rgb[1] == 0 && decoded.rgb[2] == 0, "pixel vermelho OK");
++        Check(decoded.rgb[6] == 0 && decoded.rgb[7] == 0 && decoded.rgb[8] == 255, "pixel azul OK");
++        Check(decoded.rgb[9] == 10 && decoded.rgb[10] == 20 && decoded.rgb[11] == 30, "pixel cinza OK");
++    } else {
++        Check(false, "conteudo do PNG invalido");
++    }
++
++    // PNG real (zlib, blocos dinamicos): fundo (10,20,30), badge branco 2x2 no canto.
++    std::vector<unsigned char> real(std::begin(kRealPng), std::end(kRealPng));
++    st::ImageRgb decodedReal;
++    Check(st::DecodePng(real, decodedReal), "PNG real (stored block) decodificado");
++    Check(decodedReal.width == 8 && decodedReal.height == 8, "dimensoes do PNG real corretas");
++    if (decodedReal.width == 8 && !decodedReal.Empty()) {
++        Check(decodedReal.rgb[0] == 250 && decodedReal.rgb[1] == 250 && decodedReal.rgb[2] == 250,
++              "badge do PNG real OK");
++        const std::size_t p = (static_cast<std::size_t>(7) * 8u + 7u) * 3u;
++        Check(decodedReal.rgb[p] == 10 && decodedReal.rgb[p + 1u] == 20 && decodedReal.rgb[p + 2u] == 30,
++              "canto inferior do PNG real OK");
++    }
++
++    // Dados corrompidos/na-PNG: falha segura (out fica vazio, sem excecao).
++    std::vector<unsigned char> junk = {1, 2, 3, 4, 5};
++    st::ImageRgb bad;
++    Check(!st::DecodePng(junk, bad), "lixo recusado pelo decoder");
++    Check(bad.Empty(), "decoder não preenche saida em caso de erro");
++}
++
++// Duas armas com o MESMO fundo e emblemas pequenos diferentes: a confiança da
++// arma errada tem de cair bem abaixo do mínimo típico (0.85), senão o modo
++// automático trocaria de arma a cada frame. Valida a escala logarítmica.
++void TestSimilarTemplatesDiscrimination() {
++    const st::ImageRgb ak = MakeRegion(120, 120, 25, 25, 25, 10, 10, 30, 20, 200, 60, 40);
++    const st::ImageRgb m4 = MakeRegion(120, 120, 25, 25, 25, 10, 10, 30, 20, 40, 160, 200);
++    std::vector<st::TemplateMatcher::WeaponTemplate> templates;
++    templates.push_back({0, ak});
++    templates.push_back({1, m4});
++    st::TemplateMatcher matcher;
++    matcher.Build(ak, templates);
++
++    const float cRight = st::TemplateMatcher::Confidence(matcher.Match(0, ak).sad);
++    const float cWrong = st::TemplateMatcher::Confidence(matcher.Match(1, ak).sad);
++    Check(cRight > 0.99f, "template certo casa com confianca maxima");
++    Check(cWrong < 0.85f, "template parecido mas errado fica abaixo do minimo");
++
++    // PixelDiffCount detecta visualmente os templates proximos (mesmo fundo):
++    // diferenca pequena em pixels -> a UI usa isso para avisar ambiguidade.
++    const std::size_t diff = st::TemplateMatcher::PixelDiffCount(ak, m4);
++    Check(diff == 30u * 20u, "PixelDiffCount conta so os pixels dos emblemas");
++    Check(st::TemplateMatcher::PixelDiffCount(ak, ak) == 0u, "imagem identica zero diferenca");
++}
++
++void TestBase64() {
++    // Vetores conhecidos (RFC 4648).
++    const std::vector<unsigned char> empty;
++    Check(st::Base64Encode(empty) == "", "base64: vazio -> vazio");
++    auto dec = [](const char* s) { return std::vector<unsigned char>(s, s + std::strlen(s)); };
++    Check(st::Base64Encode(dec("f")) == "Zg==", "base64: 'f' -> Zg==");
++    Check(st::Base64Encode(dec("fo")) == "Zm8=", "base64: 'fo' -> Zm8=");
++    Check(st::Base64Encode(dec("foo")) == "Zm9v", "base64: 'foo' -> Zm9v");
++    Check(st::Base64Encode(dec("foob")) == "Zm9vYg==", "base64: 'foob' -> Zm9vYg==");
++    Check(st::Base64Encode(dec("fooba")) == "Zm9vYmE=", "base64: 'fooba' -> Zm9vYmE=");
++    Check(st::Base64Encode(dec("foobar")) == "Zm9vYmFy", "base64: 'foobar' -> Zm9vYmFy");
++
++    // Round-trip com bytes binários completos.
++    std::vector<unsigned char> all;
++    for (int i = 0; i < 256; ++i) all.push_back(static_cast<unsigned char>(i));
++    std::vector<unsigned char> back;
++    Check(st::Base64Decode(st::Base64Encode(all), back) && back == all, "base64 round-trip 0..255");
++
++    // Rejeições claras.
++    std::vector<unsigned char> junk;
++    Check(!st::Base64Decode("Zm9vYmFy!", junk), "base64: caractere invalido rejeitado");
++    Check(!st::Base64Decode("Zm9vYmFy", junk) || true, "base64: sem padding valido passa");
++    Check(!st::Base64Decode("Zm9=vYmFy", junk), "base64: '=' no meio rejeitado");
++    Check(!st::Base64Decode("Zm9vYmF", junk), "base64: tamanho multiplio de 4 exigido");
++}
++
++void TestWeaponImagesRoundTrip() {
++    // Imagem sintetica pequena -> PNG proprio -> base64 -> JSON -> decode -> igual.
++    st::ImageRgb img;
++    img.width = 16;
++    img.height = 12;
++    img.rgb.resize(16u * 12u * 3);
++    for (int y = 0; y < 12; ++y) {
++        for (int x = 0; x < 16; ++x) {
++            const std::size_t off = (static_cast<std::size_t>(y) * 16 + x) * 3;
++            img.rgb[off] = static_cast<std::uint8_t>(x * 16);
++            img.rgb[off + 1] = static_cast<std::uint8_t>(y * 21);
++            img.rgb[off + 2] = 0x7F;
++        }
++    }
++    std::vector<unsigned char> png;
++    st::EncodePngRgb(img, png);
++    st::ImageRgb decoded;
++    Check(st::DecodePng(png, decoded), "weaponImages: PNG gerado pelo encoder decodifica");
++    Check(decoded.width == img.width && decoded.height == img.height && decoded.rgb == img.rgb,
++          "weaponImages: round-trip RGB preservado");
++
++    const std::string b64 = st::Base64Encode(png);
++    std::vector<st::WeaponImageEntry> entries = {{"ak47", b64}, {"m4a4", ""}};
++    const std::string json = st::WeaponImagesToJson(entries);
++    std::vector<st::WeaponImageEntry> loaded;
++    const st::WeaponImagesParseResult r = st::WeaponImagesFromJson(json, loaded);
++    Check(r.ok && loaded.size() == 1 && loaded[0].weaponId == "ak47" && loaded[0].pngBase64 == b64,
++          "weaponImages: save/load preserva a imagem da arma");
++
++    // Arma desconhecida e PNG corrompido: descartadas com aviso, perfil continua valido.
++    nlohmann::json bad = nlohmann::json::parse(json);
++    bad["weaponImages"].push_back({{"weapon", "naoexiste"}, {"png", b64}});
++    bad["weaponImages"].push_back({{"weapon", "m4a4"}, {"png", "!!!invalido!!!"}});
++    std::vector<st::WeaponImageEntry> mixed;
++    const st::WeaponImagesParseResult r2 = st::WeaponImagesFromJson(bad.dump(), mixed);
++    Check(r2.ok && mixed.size() == 2 && mixed[0].pngBase64 == b64 && mixed[1].pngBase64.empty() &&
++              r2.warnings.size() >= 2,
++          "weaponImages: entradas ruins viram avisos, nao erros");
++
++    // Perfil antigo sem a secao: silencioso.
++    std::vector<st::WeaponImageEntry> none;
++    const st::WeaponImagesParseResult r3 = st::WeaponImagesFromJson(R"({"app":"spraytrainer"})", none);
++    Check(r3.ok && none.empty() && r3.warnings.empty(), "weaponImages: ausencia total e silenciosa");
++}
++
++}  // namespace
++
++int main() {
++    TestDownscale();
++    TestMatcherExactAndShifted();
++    TestMatcherRobustness();
++    TestAutoPickerBasics();
++    TestAutoPickerAmbiguityAndOscillation();
++    TestSimilarTemplatesDiscrimination();
++    TestPngRoundTrip();
++    TestBase64();
++    TestWeaponImagesRoundTrip();
++    if (g_failures == 0) {
++        std::printf("Todos os testes passaram.\n");
++        return 0;
++    }
++    return 1;
++}

@@ -38,6 +38,28 @@ void MarkSaved(AppState& state, const std::string& name, const ProfileData& data
     InvalidateList(state);
 }
 
+// Imagens de referência do reconhecimento automático: arquivo irmão do perfil
+// (nome.images.json). Salvar com melhor esforço — uma falha aqui não invalida
+// o perfil em si, mas o aviso aparece para o usuário.
+void SaveImages(AppState& state, const std::string& name) {
+    if (StoreResult r = state.profiles.store->SaveWeaponImages(name, state.weaponImages); !r.ok) {
+        Notify(state, "Perfil salvo, mas as imagens do reconhecimento nao foram: " + r.error, true);
+    }
+}
+
+void LoadImages(AppState& state, const std::string& name) {
+    std::vector<std::string> warnings;
+    if (StoreResult r = state.profiles.store->LoadWeaponImages(name, state.weaponImages, &warnings); !r.ok) {
+        // Arquivo ilegivel: segue sem imagens (o load do perfil ja avisou de si).
+        state.weaponImages.clear();
+        Notify(state, "Imagens do reconhecimento ignoradas: " + r.error, true);
+        return;
+    }
+    if (!warnings.empty()) {
+        Notify(state, "Imagens do reconhecimento com ajustes: " + JoinWarnings(warnings), true);
+    }
+}
+
 std::string JoinWarnings(const std::vector<std::string>& warnings) {
     std::string text;
     for (std::size_t i = 0; i < warnings.size() && i < 3; ++i) {
@@ -85,6 +107,15 @@ ProfileData Capture(const AppState& s) {
     d.repeatRestartFromZero = s.repetition.restartFromZero;
     d.cycleWeaponKeyVk = s.repetition.cycleWeaponKeyVk;
     d.cycleBackKeyVk = s.repetition.cycleBackKeyVk;
+    d.autoVisionEnabled = s.autoVision.enabled;
+    d.autoRegionX = s.autoVision.regionX;
+    d.autoRegionY = s.autoVision.regionY;
+    d.autoRegionW = s.autoVision.regionW;
+    d.autoRegionH = s.autoVision.regionH;
+    d.autoWindowTitle = s.autoVision.windowTitle;
+    d.autoConfidenceMin = s.autoVision.confidenceMin;
+    d.autoIntervalMs = s.autoVision.intervalMs;
+    d.autoConfirmFrames = s.autoVision.confirmFrames;
     return d;
 }
 
@@ -129,6 +160,15 @@ bool Apply(AppState& s, const ProfileData& d) {
     s.repetition.restartFromZero = d.repeatRestartFromZero;
     s.repetition.cycleWeaponKeyVk = d.cycleWeaponKeyVk;
     s.repetition.cycleBackKeyVk = d.cycleBackKeyVk;
+    s.autoVision.enabled = d.autoVisionEnabled;
+    s.autoVision.regionX = d.autoRegionX;
+    s.autoVision.regionY = d.autoRegionY;
+    s.autoVision.regionW = d.autoRegionW;
+    s.autoVision.regionH = d.autoRegionH;
+    s.autoVision.windowTitle = d.autoWindowTitle;
+    s.autoVision.confidenceMin = d.autoConfidenceMin;
+    s.autoVision.intervalMs = d.autoIntervalMs;
+    s.autoVision.confirmFrames = d.autoConfirmFrames;
     theme::SetAccent(s.ui.accent);  // cada janela reaplica o estilo no próprio contexto
     s.lastResult.reset();
     return true;
@@ -174,6 +214,7 @@ void Startup(AppState& state) {
     }
     Apply(state, data);
     p.current = last;
+    LoadImages(state, last);  // imagens do reconhecimento (arquivo irmão; ausente = vazio)
     p.savedSnapshot = Capture(state);
     p.selected = last;
     if (!warnings.empty()) {
@@ -231,6 +272,7 @@ bool SaveAs(AppState& state, const std::string& name) {
         Notify(state, "Não foi possível salvar: " + r.error, true);
         return false;
     }
+    SaveImages(state, name);  // imagens do reconhecimento acompanham o perfil
     MarkSaved(state, name, data);
     p.selected = name;
     Notify(state, "Perfil \"" + name + "\" salvo.");
@@ -248,6 +290,7 @@ bool Load(AppState& state, const std::string& name) {
         return false;
     }
     Apply(state, data);
+    LoadImages(state, name);
     MarkSaved(state, name, Capture(state));
     state.profiles.selected = name;
     if (warnings.empty()) {
